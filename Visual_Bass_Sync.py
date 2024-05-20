@@ -1,0 +1,159 @@
+import sounddevice as sd
+import numpy as np
+import pygame
+import sys
+import colorsys
+from collections import deque
+import time
+import tkinter as tk
+from tkinter import ttk
+
+# Constants for audio processing
+RATE = 44100
+BUFFER = 1024
+TARGET_FREQS = [40, 50, 60]  # Multiple target frequencies
+SMOOTHING_WINDOW = 10
+DECAY_INTERVAL = 0.2  # Decay interval in seconds
+DECAY_RATE = 0.985  # Decay rate per interval
+UPDATE_INTERVAL = 0.025  # Interval in seconds for updating brightness
+
+# Function to detect target frequencies
+def detect_frequencies(data, rate, target_freqs):
+    data = np.ascontiguousarray(data)  # Ensure the array is contiguous
+    freqs = np.fft.fftfreq(len(data), 1 / rate)
+    fft_data = np.abs(np.fft.fft(data))
+    detected_values = []
+    for target_freq in target_freqs:
+        target_index = np.argmin(np.abs(freqs - target_freq))
+        detected_values.append(fft_data[target_index])
+    return max(detected_values)
+
+def run_visualizer(input_device_index):
+    # Initialize Pygame
+    pygame.init()
+    screen = pygame.display.set_mode((900, 500))  # Increased width to accommodate bars
+    pygame.display.set_caption("Glow Box")
+    font = pygame.font.SysFont(None, 36)
+
+    global smoothed_value
+    smoothed_value = 0
+
+    # Callback function to process audio data
+    def audio_callback(indata, frames, time_info, status):
+        if status:
+            print(status)
+        global glow_value, smoothing_buffer, last_max_time, last_update_time, current_glow_value, current_gain_db, smoothed_value
+
+        detection_value = detect_frequencies(indata[:, 0], RATE, TARGET_FREQS)  # Use only the first channel
+        smoothing_buffer.append(detection_value)
+        smoothed_value = sum(smoothing_buffer) / len(smoothing_buffer)
+
+        # Adjust the scaling factor here to allow glow_value to reach 1.0 based on the bass detection
+        new_glow_value = min(smoothed_value / 100, 1.0)  # Adjusted scaling factor
+
+        # Compute RMS value for dB calculation
+        rms_value = np.sqrt(np.mean(np.square(indata)))
+        current_gain_db = 20 * np.log10(rms_value) if rms_value > 0 else -100  # Handle log of zero
+
+        current_time = time.time()
+
+        # Rate limiting: update current_glow_value only if enough time has passed since the last update
+        if current_time - last_update_time >= UPDATE_INTERVAL:
+            if new_glow_value >= 1.0:
+                last_max_time = current_time  # Update last_max_time to current time if value hits 1.0
+            current_glow_value = new_glow_value
+            last_update_time = current_time
+
+        glow_value = current_glow_value
+
+    # Start audio stream
+    stream = sd.InputStream(samplerate=RATE, blocksize=BUFFER, channels=1, callback=audio_callback, device=input_device_index)
+    stream.start()
+
+    global glow_value, current_glow_value, hue, smoothing_buffer, last_max_time, last_update_time, current_gain_db
+    glow_value = 0
+    current_glow_value = 0
+    hue = 0
+    smoothing_buffer = deque(maxlen=SMOOTHING_WINDOW)
+    last_max_time = time.time()  # Initialize last_max_time
+    last_update_time = time.time()  # Initialize last_update_time
+    current_gain_db = -100  # Initialize to a very low dB value
+
+    # Main loop
+    running = True
+    while running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+
+        current_time = time.time()
+
+        # Decay glow_value to 90% if it's held at 100% for longer than DECAY_INTERVAL
+        if glow_value >= 1.0 and (current_time - last_max_time) > DECAY_INTERVAL:
+            glow_value = max(0.9, glow_value * DECAY_RATE)
+
+        # Cycle through hues at a slower rate
+        hue += 0.0001  # Slow increment for color cycling
+        if hue > 1:
+            hue -= 1
+
+        # Convert HSV to RGB and adjust brightness
+        r, g, b = colorsys.hsv_to_rgb(hue, 1, glow_value)
+        color = (int(r * 255), int(g * 255), int(b * 255))
+
+        # Draw the light gray box with glow effect
+        screen.fill((211, 211, 211))  # Light gray background
+        pygame.draw.rect(screen, color, pygame.Rect(150, 150, 600, 200))  # Adjusted width to 600 pixels
+
+        # Draw left and right gain bars, 50 pixels wide with a 35-pixel spacing, limited to the height of the center box
+        bar_width = 50
+        gap = 35
+        max_bar_height = 200  # Max height to match the center box
+        left_bar_height = int(min((current_gain_db + 100) / 100 * max_bar_height, max_bar_height))  # Scale dB value to bar height
+        right_bar_height = left_bar_height
+        pygame.draw.rect(screen, color, pygame.Rect(150 - bar_width - gap, 350 - left_bar_height, bar_width, left_bar_height))  # Left bar
+        pygame.draw.rect(screen, color, pygame.Rect(750 + gap, 350 - right_bar_height, bar_width, right_bar_height))  # Right bar
+
+        # Display the gain value in dB under the bars
+        left_gain_text = font.render(f"{current_gain_db:.1f} dB", True, (0, 0, 0))
+        right_gain_text = font.render(f"{current_gain_db:.1f} dB", True, (0, 0, 0))
+        screen.blit(left_gain_text, (150 - bar_width - gap, 360))
+        screen.blit(right_gain_text, (750 + gap, 360))
+
+        # Display the brightness level based on the actual glow value
+        brightness_percentage = glow_value * 100  # Directly using glow_value
+        brightness_text = font.render(f"Brightness: {int(brightness_percentage)}%", True, (0, 0, 0))
+        screen.blit(brightness_text, (350, 100))
+
+        pygame.display.flip()
+
+    # Cleanup
+    stream.stop()
+    pygame.quit()
+    sys.exit()
+
+def select_device():
+    selected_device_index = int(device_combo.get().split(':')[0])
+    root.destroy()
+    run_visualizer(selected_device_index)
+
+# Main execution block
+if __name__ == "__main__":
+    devices = sd.query_devices()
+    input_devices = [(i, device['name']) for i, device in enumerate(devices) if device['max_input_channels'] > 0]
+
+    # Create tkinter window
+    root = tk.Tk()
+    root.title("Select Input Device")
+
+    label = tk.Label(root, text="Select the input device index for capturing system audio:")
+    label.pack(pady=10)
+
+    device_combo = ttk.Combobox(root, values=[f"{index}: {name}" for index, name in input_devices], width=50)
+    device_combo.pack(pady=10)
+    device_combo.current(0)
+
+    select_button = tk.Button(root, text="Select", command=select_device)
+    select_button.pack(pady=20)
+
+    root.mainloop()

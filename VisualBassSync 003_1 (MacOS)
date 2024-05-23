@@ -1,0 +1,218 @@
+import sounddevice as sd
+import numpy as np
+import time
+import pyglet
+from pyglet.gl import *
+from pyglet import shapes
+from collections import deque
+import colorsys
+from PyQt5 import QtWidgets, QtCore
+import webbrowser
+
+# Constants for audio processing
+RATE = 44100
+BUFFER = 1024
+TARGET_FREQS = [35, 40, 45, 50, 55]  # Multiple target frequencies
+SMOOTHING_WINDOW = 10
+DECAY_INTERVAL = 0.25  # Decay interval in seconds
+DECAY_RATE = 0.75  # Decay rate per interval
+UPDATE_INTERVAL = 0.0001  # Interval in seconds for updating brightness
+SENSITIVITY_MULTIPLIER = 1.04  # Multiplier to make the visualizer more sensitive
+NUM_ORBS = 8  # Number of orbs
+BRIGHTNESS_FONT_SIZE = 56  # Font size for the brightness text
+GITHUB_FONT_SIZE = 10  # Font size for the GitHub link text (half of brightness font size)
+GITHUB_TRANSPARENCY = 145  # 65% transparency
+HORIZONTAL_ADJUSTMENT = -25  # Horizontal adjustment constant for the orbs
+
+# Pyglet window setup
+window = pyglet.window.Window(width=900, height=600, caption='3D Audio Visualizer', resizable=True)
+batch = pyglet.graphics.Batch()
+
+# Variables for audio data
+smoothed_value = 0
+glow_value = 0
+current_glow_value = 0
+smoothing_buffer = deque(maxlen=SMOOTHING_WINDOW)
+last_max_time = time.time()
+last_update_time = time.time()
+current_gain_db = -100  # Initialize to a very low dB value
+
+# Function to detect target frequencies
+def detect_frequencies(data, rate, target_freqs):
+    data = np.ascontiguousarray(data)  # Ensure the array is contiguous
+    freqs = np.fft.fftfreq(len(data), 1 / rate)
+    fft_data = np.abs(np.fft.fft(data))
+    detected_values = []
+    for target_freq in target_freqs:
+        target_index = np.argmin(np.abs(freqs - target_freq))
+        detected_values.append(fft_data[target_index])
+    return max(detected_values)
+
+# Audio callback function
+def audio_callback(indata, frames, time_info, status):
+    if status:
+        print(status)
+    global glow_value, smoothing_buffer, last_max_time, last_update_time, current_glow_value, smoothed_value, current_gain_db
+
+    detection_value = detect_frequencies(indata[:, 0], RATE, TARGET_FREQS)  # Use only the first channel
+    smoothing_buffer.append(detection_value)
+    smoothed_value = sum(smoothing_buffer) / len(smoothing_buffer)
+
+    # Adjust the scaling factor and apply sensitivity multiplier to allow glow_value to reach 1.0 based on the bass detection
+    new_glow_value = min((smoothed_value / 100) * SENSITIVITY_MULTIPLIER, 1.0)
+
+    # Compute RMS value for dB calculation
+    rms_value = np.sqrt(np.mean(np.square(indata)))
+    current_gain_db = 20 * np.log10(rms_value) if rms_value > 0 else -100  # Handle log of zero
+
+    current_time = time.time()
+
+    # Rate limiting: update current_glow_value only if enough time has passed since the last update
+    if current_time - last_update_time >= UPDATE_INTERVAL:
+        if new_glow_value >= 1.0:
+            last_max_time = current_time  # Update last_max_time to current time if value hits 1.0
+        current_glow_value = new_glow_value
+        last_update_time = current_time
+
+    glow_value = current_glow_value
+
+# Start audio stream
+def start_audio_stream(input_device_index):
+    global stream
+    stream = sd.InputStream(samplerate=RATE, blocksize=BUFFER, channels=1, callback=audio_callback, device=input_device_index)
+    stream.start()
+
+# Variables for 3D visualization
+orbs = []
+
+def create_orbs(num_orbs):
+    global orbs
+    orbs = []
+    for i in range(num_orbs):
+        orb = shapes.Circle(x=window.width // 2 + HORIZONTAL_ADJUSTMENT, y=window.height // 2, radius=18, color=(255, 255, 255), batch=batch)
+        orbs.append(orb)
+
+@window.event
+def on_draw():
+    window.clear()
+    batch.draw()
+    draw_gain_bars()
+    draw_text()
+
+@window.event
+def on_resize(width, height):
+    for orb in orbs:
+        orb.x = width // 2 + HORIZONTAL_ADJUSTMENT
+        orb.y = height // 2
+
+@window.event
+def on_mouse_press(x, y, button, modifiers):
+    if button == pyglet.window.mouse.LEFT:
+        if github_label.x < x < github_label.x + github_label.content_width and github_label.y < y < github_label.y + github_label.content_height:
+            webbrowser.open("https://github.com/Fklyf/VisualBassSync")
+
+def draw_gain_bars():
+    global glow_value, hue, current_gain_db
+
+    # Convert HSV to RGB and adjust brightness
+    r, g, b = colorsys.hsv_to_rgb(hue, 1, glow_value)
+    color = (int(r * 255), int(g * 255), int(b * 255))
+
+    bar_width = int(50 * (window.width / 900))
+    gap = int(50 + 50 * (window.width / 300))  # Ensure the bars are 50 pixels left and right of the visual
+    max_bar_height = window.height // 2  # Max height to match the center box
+    left_bar_height = int(min((current_gain_db + 100) / 100 * max_bar_height, max_bar_height))  # Scale dB value to bar height
+    right_bar_height = left_bar_height
+
+    left_bar = shapes.Rectangle(x=gap - bar_width - 50, y=window.height // 2 - max_bar_height // 2, width=bar_width, height=left_bar_height, color=color, batch=batch)
+    right_bar = shapes.Rectangle(x=window.width - gap, y=window.height // 2 - max_bar_height // 2, width=bar_width, height=right_bar_height, color=color, batch=batch)
+    left_bar.draw()
+    right_bar.draw()
+
+    label_left_gain = pyglet.text.Label(f"{current_gain_db:.1f} dB", font_size=16, x=gap - bar_width // 2 - 50, y=window.height // 2 - max_bar_height // 2 - 30, anchor_x='center', anchor_y='center', color=(255, 255, 255, 255))
+    label_right_gain = pyglet.text.Label(f"{current_gain_db:.1f} dB", font_size=16, x=window.width - gap + bar_width // 2, y=window.height // 2 - max_bar_height // 2 - 30, anchor_x='center', anchor_y='center', color=(255, 255, 255, 255))
+    label_left_gain.draw()
+    label_right_gain.draw()
+
+def draw_text():
+    global current_gain_db, glow_value, hue
+
+    brightness_percentage = glow_value * 100
+    brightness_text = f"Brightness: {int(brightness_percentage)}%"
+
+    # Convert HSV to RGB for the brightness text color
+    r, g, b = colorsys.hsv_to_rgb(hue, 1, glow_value)
+    text_color = (int(r * 255), int(g * 255), int(b * 255), 255)
+
+    label_brightness = pyglet.text.Label(brightness_text, font_size=BRIGHTNESS_FONT_SIZE, x=window.width // 2, y=window.height - 50, anchor_x='center', anchor_y='center', color=text_color)
+    label_brightness.draw()
+
+    # GitHub link in the bottom left corner
+    global github_label
+    github_label = pyglet.text.Label("https://github.com/Fklyf/VisualBassSync", font_size=GITHUB_FONT_SIZE, x=10, y=10, anchor_x='left', anchor_y='bottom', color=(255, 255, 255, GITHUB_TRANSPARENCY))
+    github_label.draw()
+
+def update(dt):
+    global orbs, glow_value, hue
+    hue += 0.005  # Slow increment for color cycling
+    if hue > 1:
+        hue -= 1
+
+    r, g, b = colorsys.hsv_to_rgb(hue, 1, glow_value)  # Use glow_value as brightness
+    color = (int(r * 255), int(g * 255), int(b * 255))
+
+    for orb in orbs:
+        orb.x = window.width // 2 + HORIZONTAL_ADJUSTMENT + np.random.randint(-window.width // 4, window.width // 4)
+        orb.y = window.height // 2 + np.random.randint(-window.height // 4, window.height // 4)
+        orb.radius = 10 + glow_value * 50
+        orb.opacity = int(glow_value * 255)
+        orb.color = color
+
+pyglet.clock.schedule_interval(update, 1 / 60.0)
+
+class DeviceSelectionDialog(QtWidgets.QDialog):
+    def __init__(self, devices):
+        super().__init__()
+        self.setWindowTitle("Select Input Device")
+        self.devices = devices
+
+        self.layout = QtWidgets.QVBoxLayout()
+
+        self.label = QtWidgets.QLabel("Select the input device index for capturing system audio:")
+        self.layout.addWidget(self.label)
+
+        self.device_combo = QtWidgets.QComboBox()
+        self.device_combo.addItems([f"{index}: {name}" for index, name in self.devices])
+        self.layout.addWidget(self.device_combo)
+
+        self.select_button = QtWidgets.QPushButton("Select")
+        self.select_button.clicked.connect(self.accept)
+        self.layout.addWidget(self.select_button)
+
+        self.setLayout(self.layout)
+
+    def get_selected_device_index(self):
+        return int(self.device_combo.currentText().split(':')[0])
+
+def run_visualizer(input_device_index):
+    global hue
+    hue = 0  # Initialize hue for color cycling
+    create_orbs(NUM_ORBS)
+    start_audio_stream(input_device_index)
+    pyglet.app.run()
+
+def select_device():
+    app = QtWidgets.QApplication([])
+    devices = sd.query_devices()
+    input_devices = [(i, device['name']) for i, device in enumerate(devices) if device['max_input_channels'] > 0]
+
+    dialog = DeviceSelectionDialog(input_devices)
+    if dialog.exec_() == QtWidgets.QDialog.Accepted:
+        selected_device_index = dialog.get_selected_device_index()
+        run_visualizer(selected_device_index)
+    else:
+        print("No device selected.")
+
+# Main execution block
+if __name__ == "__main__":
+    select_device()

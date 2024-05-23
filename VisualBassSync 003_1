@@ -13,12 +13,12 @@ import webbrowser
 # Constants for audio processing
 RATE = 44100
 BUFFER = 1024
-TARGET_FREQS = [40, 45, 50, 55]  # Multiple target frequencies
+TARGET_FREQS = [35, 40, 45, 50, 55]  # Multiple target frequencies
 SMOOTHING_WINDOW = 10
-DECAY_INTERVAL = 0.2  # Decay interval in seconds
-DECAY_RATE = 0.985  # Decay rate per interval (less aggressive decay)
-UPDATE_INTERVAL = 0.020  # Interval in seconds for updating brightness (twice as slow)
-SENSITIVITY_MULTIPLIER = 1.2  # Multiplier to make the visualizer more sensitive
+DECAY_INTERVAL = 0.25  # Decay interval in seconds
+DECAY_RATE = 1  # Decay rate per interval
+UPDATE_INTERVAL = 0.0001  # Interval in seconds for updating brightness
+SENSITIVITY_MULTIPLIER = 1.04  # Multiplier to make the visualizer more sensitive
 NUM_ORBS = 8  # Number of orbs
 BRIGHTNESS_FONT_SIZE = 56  # Font size for the brightness text
 GITHUB_FONT_SIZE = 10  # Font size for the GitHub link text (half of brightness font size)

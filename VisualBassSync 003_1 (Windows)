@@ -9,6 +9,7 @@ import colorsys
 import tkinter as tk
 from tkinter import ttk
 import webbrowser
+import logging
 
 # Constants for audio processing
 RATE = 44100
@@ -16,14 +17,25 @@ BUFFER = 1024
 TARGET_FREQS = [35, 40, 45, 50, 55]  # Multiple target frequencies
 SMOOTHING_WINDOW = 10
 DECAY_INTERVAL = 0.25  # Decay interval in seconds
-DECAY_RATE = 1  # Decay rate per interval
+DECAY_RATE = 0.75  # Decay rate per interval
 UPDATE_INTERVAL = 0.0001  # Interval in seconds for updating brightness
 SENSITIVITY_MULTIPLIER = 1.04  # Multiplier to make the visualizer more sensitive
 NUM_ORBS = 8  # Number of orbs
 BRIGHTNESS_FONT_SIZE = 56  # Font size for the brightness text
 GITHUB_FONT_SIZE = 10  # Font size for the GitHub link text (half of brightness font size)
 GITHUB_TRANSPARENCY = 145  # 65% transparency
-HORIZONTAL_ADJUSTMENT = -25  # Horizontal adjustment constant for the orbs
+HORIZONTAL_ADJUSTMENT = 0  # Horizontal adjustment constant for the orbs
+SHAKE_INTENSITY = 10  # Maximum shake intensity
+BLACK_HOLE_STRENGTH = 0.05  # Strength of the black hole effect
+PULL_FROM_CENTER = True  # If True, pull orbs from the center outward; if False, pull orbs from the edges inward
+ESCAPE_MODE = False  # If True, orbs escape randomly
+
+# Easter egg sequence detection
+easter_egg_sequence = "rgb"
+current_sequence = ""
+
+# Set up logging
+logging.basicConfig(level=logging.WARNING)
 
 # Pyglet window setup
 window = pyglet.window.Window(width=900, height=600, caption='3D Audio Visualizer', resizable=True)
@@ -37,6 +49,7 @@ smoothing_buffer = deque(maxlen=SMOOTHING_WINDOW)
 last_max_time = time.time()
 last_update_time = time.time()
 current_gain_db = -100  # Initialize to a very low dB value
+hue = 0
 
 # Function to detect target frequencies
 def detect_frequencies(data, rate, target_freqs):
@@ -53,25 +66,22 @@ def detect_frequencies(data, rate, target_freqs):
 def audio_callback(indata, frames, time_info, status):
     if status:
         print(status)
-    global glow_value, smoothing_buffer, last_max_time, last_update_time, current_glow_value, smoothed_value, current_gain_db
+    global glow_value, smoothing_buffer, last_max_time, last_update_time, current_glow_value, smoothed_value, current_gain_db, hue
+
+    current_time = time.time()
 
     detection_value = detect_frequencies(indata[:, 0], RATE, TARGET_FREQS)  # Use only the first channel
     smoothing_buffer.append(detection_value)
     smoothed_value = sum(smoothing_buffer) / len(smoothing_buffer)
 
-    # Adjust the scaling factor and apply sensitivity multiplier to allow glow_value to reach 1.0 based on the bass detection
     new_glow_value = min((smoothed_value / 100) * SENSITIVITY_MULTIPLIER, 1.0)
 
-    # Compute RMS value for dB calculation
     rms_value = np.sqrt(np.mean(np.square(indata)))
-    current_gain_db = 20 * np.log10(rms_value) if rms_value > 0 else -100  # Handle log of zero
+    current_gain_db = 20 * np.log10(rms_value) if rms_value > 0 else "-INF"  # Handle log of zero
 
-    current_time = time.time()
-
-    # Rate limiting: update current_glow_value only if enough time has passed since the last update
     if current_time - last_update_time >= UPDATE_INTERVAL:
         if new_glow_value >= 1.0:
-            last_max_time = current_time  # Update last_max_time to current time if value hits 1.0
+            last_max_time = current_time
         current_glow_value = new_glow_value
         last_update_time = current_time
 
@@ -103,8 +113,8 @@ def on_draw():
 @window.event
 def on_resize(width, height):
     for orb in orbs:
-        orb.x = width // 2 + HORIZONTAL_ADJUSTMENT
-        orb.y = height // 2
+        orb.x = width // 2  # Center horizontally
+        orb.y = height // 2  # Center vertically
 
 @window.event
 def on_mouse_press(x, y, button, modifiers):
@@ -112,26 +122,38 @@ def on_mouse_press(x, y, button, modifiers):
         if github_label.x < x < github_label.x + github_label.content_width and github_label.y < y < github_label.y + github_label.content_height:
             webbrowser.open("https://github.com/Fklyf/VisualBassSync")
 
+@window.event
+def on_key_press(symbol, modifiers):
+    global current_sequence, ESCAPE_MODE
+    key = chr(symbol)
+    current_sequence += key
+    if easter_egg_sequence in current_sequence:
+        current_sequence = ""
+        ESCAPE_MODE = not ESCAPE_MODE
+        print("Easter egg activated! Toggled escape mode.")
+
 def draw_gain_bars():
     global glow_value, hue, current_gain_db
 
-    # Convert HSV to RGB and adjust brightness
     r, g, b = colorsys.hsv_to_rgb(hue, 1, glow_value)
     color = (int(r * 255), int(g * 255), int(b * 255))
 
     bar_width = int(50 * (window.width / 900))
-    gap = int(50 + 50 * (window.width / 300))  # Ensure the bars are 50 pixels left and right of the visual
+    gap = int(150 * (window.width / 900))  # Adjust the gap to position bars correctly
     max_bar_height = window.height // 2  # Max height to match the center box
     left_bar_height = int(min((current_gain_db + 100) / 100 * max_bar_height, max_bar_height))  # Scale dB value to bar height
     right_bar_height = left_bar_height
 
-    left_bar = shapes.Rectangle(x=gap - bar_width - 50, y=window.height // 2 - max_bar_height // 2, width=bar_width, height=left_bar_height, color=color, batch=batch)
-    right_bar = shapes.Rectangle(x=window.width - gap, y=window.height // 2 - max_bar_height // 2, width=bar_width, height=right_bar_height, color=color, batch=batch)
+    left_bar_x = gap - bar_width  # Adjust to position it to the left of the visual box
+    right_bar_x = window.width - gap  # Adjust to position it to the right of the visual box
+
+    left_bar = shapes.Rectangle(x=left_bar_x, y=window.height // 2 - max_bar_height // 2, width=bar_width, height=left_bar_height, color=color, batch=batch)
+    right_bar = shapes.Rectangle(x=right_bar_x, y=window.height // 2 - max_bar_height // 2, width=bar_width, height=right_bar_height, color=color, batch=batch)
     left_bar.draw()
     right_bar.draw()
 
-    label_left_gain = pyglet.text.Label(f"{current_gain_db:.1f} dB", font_size=16, x=gap - bar_width // 2 - 50, y=window.height // 2 - max_bar_height // 2 - 30, anchor_x='center', anchor_y='center', color=(255, 255, 255, 255))
-    label_right_gain = pyglet.text.Label(f"{current_gain_db:.1f} dB", font_size=16, x=window.width - gap + bar_width // 2, y=window.height // 2 - max_bar_height // 2 - 30, anchor_x='center', anchor_y='center', color=(255, 255, 255, 255))
+    label_left_gain = pyglet.text.Label(f"{current_gain_db:.1f} dB", font_size=16, x=left_bar_x + bar_width // 2, y=window.height // 2 - max_bar_height // 2 - 30, anchor_x='center', anchor_y='center', color=(255, 255, 255, 255))
+    label_right_gain = pyglet.text.Label(f"{current_gain_db:.1f} dB", font_size=16, x=right_bar_x + bar_width // 2, y=window.height // 2 - max_bar_height // 2 - 30, anchor_x='center', anchor_y='center', color=(255, 255, 255, 255))
     label_left_gain.draw()
     label_right_gain.draw()
 
@@ -141,14 +163,12 @@ def draw_text():
     brightness_percentage = glow_value * 100
     brightness_text = f"Brightness: {int(brightness_percentage)}%"
 
-    # Convert HSV to RGB for the brightness text color
     r, g, b = colorsys.hsv_to_rgb(hue, 1, glow_value)
     text_color = (int(r * 255), int(g * 255), int(b * 255), 255)
 
     label_brightness = pyglet.text.Label(brightness_text, font_size=BRIGHTNESS_FONT_SIZE, x=window.width // 2, y=window.height - 50, anchor_x='center', anchor_y='center', color=text_color)
     label_brightness.draw()
 
-    # GitHub link in the bottom left corner
     global github_label
     github_label = pyglet.text.Label("https://github.com/Fklyf/VisualBassSync", font_size=GITHUB_FONT_SIZE, x=10, y=10, anchor_x='left', anchor_y='bottom', color=(255, 255, 255, GITHUB_TRANSPARENCY))
     github_label.draw()
@@ -163,8 +183,34 @@ def update(dt):
     color = (int(r * 255), int(g * 255), int(b * 255))
 
     for orb in orbs:
-        orb.x = window.width // 2 + HORIZONTAL_ADJUSTMENT + np.random.randint(-window.width // 4, window.width // 4)
-        orb.y = window.height // 2 + np.random.randint(-window.height // 4, window.height // 4)
+        # Calculate distance from the center
+        distance_from_center = np.sqrt((orb.x - window.width // 2) ** 2 + (orb.y - window.height // 2) ** 2)
+        if distance_from_center == 0:
+            distance_from_center = 1  # Prevent division by zero
+
+        max_distance = min(window.width, window.height) // 2
+
+        if ESCAPE_MODE:
+            # Escape mode: Orbs move randomly
+            orb.x += np.random.uniform(-SHAKE_INTENSITY, SHAKE_INTENSITY) * glow_value
+            orb.y += np.random.uniform(-SHAKE_INTENSITY, SHAKE_INTENSITY) * glow_value
+        else:
+            # Determine the direction towards or away from the center
+            if PULL_FROM_CENTER:
+                direction_x = (window.width // 2 - orb.x) / distance_from_center
+                direction_y = (window.height // 2 - orb.y) / distance_from_center
+                orb.x += direction_x * (max_distance * (1 - glow_value)) + np.random.uniform(-SHAKE_INTENSITY, SHAKE_INTENSITY) * glow_value
+                orb.y += direction_y * (max_distance * (1 - glow_value)) + np.random.uniform(-SHAKE_INTENSITY, SHAKE_INTENSITY) * glow_value
+            else:
+                direction_x = (orb.x - window.width // 2) / distance_from_center
+                direction_y = (orb.y - window.height // 2) / distance_from_center
+                orb.x += direction_x * (BLACK_HOLE_STRENGTH * max_distance * glow_value) + np.random.uniform(-SHAKE_INTENSITY, SHAKE_INTENSITY) * glow_value
+                orb.y += direction_y * (BLACK_HOLE_STRENGTH * max_distance * glow_value) + np.random.uniform(-SHAKE_INTENSITY, SHAKE_INTENSITY) * glow_value
+
+        # Ensure orbs stay within the window boundaries
+        orb.x = max(orb.radius, min(window.width - orb.radius, orb.x))
+        orb.y = max(orb.radius, min(window.height - orb.radius, orb.y))
+
         orb.radius = 10 + glow_value * 50
         orb.opacity = int(glow_value * 255)
         orb.color = color
@@ -188,7 +234,6 @@ if __name__ == "__main__":
     devices = sd.query_devices()
     input_devices = [(i, device['name']) for i, device in enumerate(devices) if device['max_input_channels'] > 0]
 
-    # Create tkinter window
     root = tk.Tk()
     root.title("Select Input Device")
 

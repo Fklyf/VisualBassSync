@@ -14,11 +14,12 @@ import logging
 # Constants for audio processing
 RATE = 44100
 BUFFER = 1024
-TARGET_FREQS = [35, 40, 45, 50, 55]  # Multiple target frequencies here
+TARGET_FREQS = [35, 40, 45, 50, 55]  # Multiple target frequencies
 SMOOTHING_WINDOW = 10
 DECAY_INTERVAL = 0.25  # Decay interval in seconds
 DECAY_RATE = 0.75  # Decay rate per interval
-UPDATE_INTERVAL = 0.0002  # Interval in seconds for updating brightness
+UPDATE_INTERVAL = 0.000001  # Interval in seconds for updating brightness
+COLOR_UPDATE_INTERVAL = 0.004  # Interval in seconds for updating color
 SENSITIVITY_MULTIPLIER = 1.04  # Multiplier to make the visualizer more sensitive
 NUM_ORBS = 8  # Number of orbs
 BRIGHTNESS_FONT_SIZE = 56  # Font size for the brightness text
@@ -48,6 +49,7 @@ current_glow_value = 0
 smoothing_buffer = deque(maxlen=SMOOTHING_WINDOW)
 last_max_time = time.time()
 last_update_time = time.time()
+last_color_update_time = time.time()
 current_gain_db = -100  # Initialize to a very low dB value
 hue = 0
 
@@ -66,7 +68,7 @@ def detect_frequencies(data, rate, target_freqs):
 def audio_callback(indata, frames, time_info, status):
     if status:
         print(status)
-    global glow_value, smoothing_buffer, last_max_time, last_update_time, current_glow_value, smoothed_value, current_gain_db, hue
+    global glow_value, smoothing_buffer, last_max_time, last_update_time, current_glow_value, smoothed_value, current_gain_db, last_color_update_time, hue
 
     current_time = time.time()
 
@@ -86,6 +88,21 @@ def audio_callback(indata, frames, time_info, status):
         last_update_time = current_time
 
     glow_value = current_glow_value
+
+    # Rate limiting: update color only if enough time has passed since the last color update
+    if current_time - last_color_update_time >= COLOR_UPDATE_INTERVAL:
+        update_visual(glow_value, hue)
+        last_color_update_time = current_time
+
+def update_visual(brightness, hue):
+    global orbs
+
+    # Update the visualizer color
+    r, g, b = colorsys.hsv_to_rgb(hue, 1, brightness)
+    color = (int(r * 255), int(g * 255), int(b * 255))
+
+    for orb in orbs:
+        orb.color = color
 
 # Start audio stream
 def start_audio_stream(input_device_index):

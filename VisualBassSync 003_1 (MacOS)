@@ -154,7 +154,7 @@ def draw_text():
 
 def update(dt):
     global orbs, glow_value, hue
-    hue += 0.005  # Slow increment for color cycling
+    hue += 0.0004  # Slow increment for color cycling
     if hue > 1:
         hue -= 1
 

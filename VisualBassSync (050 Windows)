@@ -1,0 +1,634 @@
+import sounddevice as sd
+import numpy as np
+import time
+import pyglet
+from pyglet import shapes
+from collections import deque
+import colorsys
+import logging
+import tkinter as tk
+from tkinter import ttk
+import sys
+import atexit
+import webbrowser
+
+# Constants for audio processing
+RATE = 44100
+BUFFER = 512
+TARGET_FREQS = [35, 40, 45, 50, 55]  # Multiple target frequencies
+SMOOTHING_WINDOW = 10
+DECAY_INTERVAL = 1  # Decay interval in seconds
+DECAY_RATE = 5  # Decay rate per interval
+UPDATE_INTERVAL = 0.0002  # Interval in seconds for updating brightness
+SENSITIVITY_MULTIPLIER = 1.035  # Multiplier to make the visualizer more sensitive
+NUM_ORBS = 25  # Number of orbs
+BRIGHTNESS_FONT_SIZE = 56  # Font size for the brightness text
+GITHUB_FONT_SIZE = 10  # Font size for the GitHub link text
+GITHUB_TRANSPARENCY = 145  # Text transparency (150%)
+HORIZONTAL_ADJUSTMENT = 0  # Horizontal adjustment constant for the orbs
+SHAKE_INTENSITY = 10  # Maximum shake intensity
+BLACK_HOLE_STRENGTH = 0.07  # Strength of the black hole effect
+PULL_FROM_CENTER = True  # If True, pull orbs from the center outward; if False, pull orbs from the edges inward
+ESCAPE_MODE = False  # If True, orbs escape randomly
+
+# Constants for GUI layout
+MENU_WIDTH = 140
+MENU_HEIGHT = 190
+MENU_PADDING = 5
+TEXT_HEIGHT = 10
+TEXT_PADDING = 10
+BOTTOM_MARGIN = 30  # Margin from the bottom of the window
+
+# Additional constants for positioning
+LABEL_X_OFFSET = 50
+VALUE_X_OFFSET = 0
+ROW_HEIGHT = 30
+TEXT_SIZE = 12
+
+# Default positions for the control menu
+MENU_X = 690
+MENU_Y = 225
+
+# Easter egg sequence detection
+easter_egg_sequence = "rgb"
+current_sequence = ""
+
+# Set up logging
+logging.basicConfig(level=logging.ERROR)
+
+# Pyglet window setup
+window = pyglet.window.Window(width=900, height=600, caption='3D Audio Visualizer', resizable=True)
+batch = pyglet.graphics.Batch()
+
+# Variables for audio data
+smoothed_value = 0
+glow_value = 0
+current_glow_value = 0
+smoothing_buffer = deque(maxlen=SMOOTHING_WINDOW)
+last_max_time = time.time()
+last_update_time = time.time()
+current_gain_db = -100  # Initialize to a very low dB value
+hue = 0
+manual_hue = False  # Flag for manual hue setting
+control_menu_visible = False  # Flag to track control menu visibility
+
+# Variables for control settings
+control_hue = 0
+control_speed = 0.0004
+control_gravity = BLACK_HOLE_STRENGTH
+control_orb_amount = NUM_ORBS
+control_sensitivity = SENSITIVITY_MULTIPLIER
+control_brightness_floor = 0.0  # Brightness floor as a percentage
+
+# Function to detect target frequencies
+def detect_frequencies(data, rate, target_freqs):
+    try:
+        data = np.ascontiguousarray(data)  # Ensure the array is contiguous
+        freqs = np.fft.fftfreq(len(data), 1 / rate)
+        fft_data = np.abs(np.fft.fft(data))
+        detected_values = []
+        for target_freq in target_freqs:
+            target_index = np.argmin(np.abs(freqs - target_freq))
+            detected_values.append(fft_data[target_index])
+        return max(detected_values)
+    except Exception as e:
+        logging.error(f"Error in detect_frequencies: {e}")
+        return 0
+
+# Audio callback function
+def audio_callback(indata, frames, time_info, status):
+    try:
+        if status:
+            logging.warning(status)
+        global glow_value, smoothing_buffer, last_max_time, last_update_time, current_glow_value, smoothed_value, current_gain_db, hue
+
+        current_time = time.time()
+
+        detection_value = detect_frequencies(indata[:, 0], RATE, TARGET_FREQS)  # Use only the first channel
+        smoothing_buffer.append(detection_value)
+        smoothed_value = sum(smoothing_buffer) / len(smoothing_buffer)
+
+        new_glow_value = min((smoothed_value / 100) * control_sensitivity, 1.0)
+
+        rms_value = np.sqrt(np.mean(np.square(indata)))
+        current_gain_db = 22 * np.log10(rms_value) if rms_value > 0 else -100  # Handle log of zero
+
+        if current_time - last_update_time >= UPDATE_INTERVAL:
+            if new_glow_value >= 1.0:
+                last_max_time = current_time
+            current_glow_value = new_glow_value
+            last_update_time = current_time
+
+        glow_value = current_glow_value
+    except Exception as e:
+        logging.error(f"Error in audio_callback: {e}")
+
+# Start audio stream
+def start_audio_stream(input_device_index):
+    global stream
+    try:
+        stream = sd.InputStream(samplerate=RATE, blocksize=BUFFER, channels=1, callback=audio_callback, device=input_device_index)
+        stream.start()
+    except Exception as e:
+        logging.error(f"Failed to start audio stream: {e}")
+        sys.exit(1)
+
+# Variables for 3D visualization
+orbs = []
+
+def create_orbs(num_orbs):
+    global orbs
+    try:
+        orbs = []
+        for i in range(num_orbs):
+            orb = shapes.Circle(x=window.width // 2 + HORIZONTAL_ADJUSTMENT, y=window.height // 2, radius=18, color=(255, 255, 255), batch=batch)
+            orbs.append(orb)
+    except Exception as e:
+        logging.error(f"Error in create_orbs: {e}")
+
+@window.event
+def on_draw():
+    try:
+        window.clear()
+        batch.draw()
+        draw_gain_bars()
+        draw_text()
+        if control_menu_visible:
+            draw_control_menu()
+    except Exception as e:
+        logging.error(f"Error in on_draw: {e}")
+
+@window.event
+def on_resize(width, height):
+    try:
+        for orb in orbs:
+            orb.x = width // 2  # Center horizontally
+            orb.y = height // 2  # Center vertically
+        align_control_menu()
+    except Exception as e:
+        logging.error(f"Error in on_resize: {e}")
+
+def align_control_menu():
+    global hue_field, speed_field, gravity_field, orbs_field, sensitivity_field, brightness_floor_field, MENU_X, MENU_Y
+
+    MENU_X = window.width - MENU_WIDTH - MENU_PADDING
+    MENU_Y = BOTTOM_MARGIN + MENU_HEIGHT + MENU_PADDING
+
+    hue_field.update_position(MENU_X + LABEL_X_OFFSET, MENU_Y - ROW_HEIGHT * 1)
+    speed_field.update_position(MENU_X + LABEL_X_OFFSET, MENU_Y - ROW_HEIGHT * 2)
+    gravity_field.update_position(MENU_X + LABEL_X_OFFSET, MENU_Y - ROW_HEIGHT * 3)
+    orbs_field.update_position(MENU_X + LABEL_X_OFFSET, MENU_Y - ROW_HEIGHT * 4)
+    sensitivity_field.update_position(MENU_X + LABEL_X_OFFSET, MENU_Y - ROW_HEIGHT * 5)
+    brightness_floor_field.update_position(MENU_X + LABEL_X_OFFSET, MENU_Y - ROW_HEIGHT * 6)
+
+@window.event
+def on_mouse_press(x, y, button, modifiers):
+    try:
+        if button == pyglet.window.mouse.LEFT:
+            # Check if the click is within the control menu toggle area
+            if (window.width - 150) < x < window.width and 0 < y < 40:
+                toggle_control_menu()
+            # Process clicks within the control menu if it's visible
+            elif control_menu_visible:
+                process_control_menu_click(x, y)
+            # Check if the click is on the GitHub label
+            if github_label.x < x < github_label.x + github_label.content_width and github_label.y < y < github_label.y + github_label.content_height:
+                webbrowser.open("https://github.com/Fklyf/VisualBassSync")
+    except Exception as e:
+        logging.error(f"Error in on_mouse_press: {e}")
+
+@window.event
+def on_text(text):
+    try:
+        global hue_field, speed_field, gravity_field, orbs_field, sensitivity_field, brightness_floor_field
+        if hue_field.active:
+            hue_field.set_value(hue_field.value + text)
+        elif speed_field.active:
+            if text.isdigit() or text == '.':
+                speed_field.set_value(speed_field.value + text)
+        elif gravity_field.active:
+            gravity_field.set_value(gravity_field.value + text)
+        elif orbs_field.active:
+            orbs_field.set_value(orbs_field.value + text)
+        elif sensitivity_field.active:
+            sensitivity_field.set_value(sensitivity_field.value + text)
+        elif brightness_floor_field.active:
+            brightness_floor_field.set_value(brightness_floor_field.value + text)
+    except Exception as e:
+        logging.error(f"Error in on_text: {e}")
+
+@window.event
+def on_key_press(symbol, modifiers):
+    try:
+        global hue_field, speed_field, gravity_field, orbs_field, sensitivity_field, brightness_floor_field
+        if symbol == pyglet.window.key.BACKSPACE:
+            if hue_field.active:
+                hue_field.set_value(hue_field.value[:-1])
+            elif speed_field.active:
+                speed_field.set_value(speed_field.value[:-1])
+            elif gravity_field.active:
+                gravity_field.set_value(gravity_field.value[:-1])
+            elif orbs_field.active:
+                orbs_field.set_value(orbs_field.value[:-1])
+            elif sensitivity_field.active:
+                sensitivity_field.set_value(sensitivity_field.value[:-1])
+            elif brightness_floor_field.active:
+                brightness_floor_field.set_value(brightness_floor_field.value[:-1])
+        elif symbol == pyglet.window.key.ENTER:
+            if hue_field.active:
+                apply_hue_setting()
+                hue_field.set_active(False)
+            elif speed_field.active:
+                apply_speed_setting()
+                speed_field.set_active(False)
+            elif gravity_field.active:
+                apply_gravity_setting()
+                gravity_field.set_active(False)
+            elif orbs_field.active:
+                apply_orbs_setting()
+                orbs_field.set_active(False)
+            elif sensitivity_field.active:
+                apply_sensitivity_setting()
+                sensitivity_field.set_active(False)
+            elif brightness_floor_field.active:
+                apply_brightness_floor_setting()
+                brightness_floor_field.set_active(False)
+        else:
+            global current_sequence, ESCAPE_MODE
+            key = chr(symbol)
+            current_sequence += key
+            if easter_egg_sequence in current_sequence:
+                current_sequence = ""
+                ESCAPE_MODE = not ESCAPE_MODE
+                print("Easter egg activated! Toggled escape mode.")
+    except Exception as e:
+        logging.error(f"Error in on_key_press: {e}")
+
+def apply_hue_setting():
+    global hue, control_hue, manual_hue
+    try:
+        control_hue = int(hue_field.value)
+        if control_hue == 0:
+            manual_hue = False
+        else:
+            hue = control_hue / 360.0
+            manual_hue = True
+    except ValueError:
+        pass
+
+def apply_speed_setting():
+    global control_speed
+    try:
+        control_speed = min(float(speed_field.value), 0.9999999)  # Restrict speed value
+    except ValueError:
+        pass
+
+def apply_gravity_setting():
+    global control_gravity
+    try:
+        control_gravity = float(gravity_field.value)
+    except ValueError:
+        pass
+
+def apply_orbs_setting():
+    global control_orb_amount, orbs
+    try:
+        control_orb_amount = int(orbs_field.value)
+        orbs = []
+        create_orbs(control_orb_amount)
+    except ValueError:
+        pass
+
+def apply_sensitivity_setting():
+    global control_sensitivity
+    try:
+        control_sensitivity = float(sensitivity_field.value)
+    except ValueError:
+        pass
+
+def apply_brightness_floor_setting():
+    global control_brightness_floor
+    try:
+        control_brightness_floor = float(brightness_floor_field.value) / 100.0  # Convert percentage to decimal
+    except ValueError:
+        pass
+
+def draw_gain_bars():
+    global glow_value, hue, current_gain_db, control_brightness_floor
+
+    try:
+        r, g, b = colorsys.hsv_to_rgb(hue, 1, max(glow_value, control_brightness_floor))
+        color = (int(r * 255), int(g * 255), int(b * 255))
+
+        bar_width = int(50 * (window.width / 900))
+        gap = int(150 * (window.width / 900))  # Adjust the gap to position bars correctly
+        max_bar_height = window.height // 2  # Max height to match the center box
+        left_bar_height = int(min((current_gain_db + 100) / 100 * max_bar_height, max_bar_height))  # Scale dB value to bar height
+        right_bar_height = left_bar_height
+
+        left_bar_x = gap - bar_width  # Adjust to position it to the left of the visual box
+        right_bar_x = window.width - gap  # Adjust to position it to the right of the visual box
+
+        left_bar = shapes.Rectangle(x=left_bar_x, y=window.height // 2 - max_bar_height // 2, width=bar_width, height=left_bar_height, color=color, batch=batch)
+        right_bar = shapes.Rectangle(x=right_bar_x, y=window.height // 2 - max_bar_height // 2, width=bar_width, height=right_bar_height, color=color, batch=batch)
+        left_bar.draw()
+        right_bar.draw()
+
+        label_left_gain = pyglet.text.Label(f"{current_gain_db:.1f} dB", font_size=16, x=left_bar_x + bar_width // 2, y=window.height // 2 - max_bar_height // 2 - 30, anchor_x='center', anchor_y='center', color=(255, 255, 255, 255))
+        label_right_gain = pyglet.text.Label(f"{current_gain_db:.1f} dB", font_size=16, x=right_bar_x + bar_width // 2, y=window.height // 2 - max_bar_height // 2 - 30, anchor_x='center', anchor_y='center', color=(255, 255, 255, 255))
+        label_left_gain.draw()
+        label_right_gain.draw()
+    except Exception as e:
+        logging.error(f"Error in draw_gain_bars: {e}")
+
+def draw_text():
+    global current_gain_db, glow_value, hue, control_brightness_floor
+
+    try:
+        brightness_percentage = max(glow_value, control_brightness_floor) * 100
+        brightness_text = f"Brightness: {int(brightness_percentage)}%"
+
+        r, g, b = colorsys.hsv_to_rgb(hue, 1, max(glow_value, control_brightness_floor))
+        text_color = (int(r * 255), int(g * 255), int(b * 255), 255)
+
+        label_brightness = pyglet.text.Label(brightness_text, font_size=BRIGHTNESS_FONT_SIZE, x=window.width // 2, y=window.height - 50, anchor_x='center', anchor_y='center', color=text_color)
+        label_brightness.draw()
+
+        global github_label
+        github_label = pyglet.text.Label("https://github.com/Fklyf/VisualBassSync", font_size=GITHUB_FONT_SIZE, x=10, y=10, anchor_x='left', anchor_y='bottom', color=(255, 255, 255, GITHUB_TRANSPARENCY))
+        github_label.draw()
+
+        global control_label
+        control_label = pyglet.text.Label("Control Menu", font_size=GITHUB_FONT_SIZE, x=window.width - 10, y=10, anchor_x='right', anchor_y='bottom', color=(255, 255, 255, GITHUB_TRANSPARENCY))
+        control_label.draw()
+    except Exception as e:
+        logging.error(f"Error in draw_text: {e}")
+
+class EditableField:
+    def __init__(self, label, x, y, width=70, height=20, initial_value=""):
+        self.label = pyglet.text.Label(label, font_size=10, x=x, y=y + 20, anchor_x='center', anchor_y='center', color=(255, 255, 255, 255))
+        self.text = pyglet.text.Label(initial_value, font_size=10, x=x + width, y=y, anchor_x='center', anchor_y='center', color=(255, 255, 255, 255))
+        self.value = initial_value
+        self.width = width
+        self.height = height
+        self.x = x
+        self.y = y
+        self.active = False
+
+    def draw(self):
+        self.label.draw()
+        self.text.draw()
+
+    def hit_test(self, x, y):
+        return self.x < x < self.x + self.width and self.y - self.height // 2 < y < self.y + self.height // 2
+
+    def set_active(self, active):
+        self.active = active
+        if self.active:
+            self.text.color = (0, 255, 0, 255)
+        else:
+            self.text.color = (255, 255, 255, 255)
+
+    def set_value(self, value):
+        self.value = value
+        self.text.text = value
+
+    def update_position(self, x, y):
+        self.x = x
+        self.y = y
+        self.label.x = x
+        self.label.y = y + 20
+        self.text.x = x + self.width
+        self.text.y = y
+
+def draw_control_menu():
+    try:
+        global control_hue, control_speed, control_gravity, control_orb_amount, control_sensitivity, control_brightness_floor
+        global hue_field, speed_field, gravity_field, orbs_field, sensitivity_field, brightness_floor_field
+
+        align_control_menu()
+
+        menu_x = window.width - MENU_WIDTH - MENU_PADDING
+        menu_y = BOTTOM_MARGIN + MENU_HEIGHT + MENU_PADDING
+
+        menu_background = shapes.Rectangle(x=menu_x - MENU_PADDING, y=menu_y - MENU_HEIGHT - MENU_PADDING, width=MENU_WIDTH + 2 * MENU_PADDING, height=MENU_HEIGHT + 2 * MENU_PADDING, color=(50, 50, 50), batch=batch)
+        menu_background.opacity = 200
+        menu_background.draw()
+
+        hue_field.draw()
+        speed_field.draw()
+        gravity_field.draw()
+        orbs_field.draw()
+        sensitivity_field.draw()
+        brightness_floor_field.draw()
+
+    except Exception as e:
+        logging.error(f"Error in draw_control_menu: {e}")
+
+def update(dt):
+    global orbs, glow_value, hue, manual_hue, control_speed, control_gravity, control_orb_amount, control_sensitivity, control_brightness_floor
+    try:
+        if not manual_hue:
+            hue += control_speed  # Use control speed for color cycling
+            if hue > 1:
+                hue -= 1
+
+        r, g, b = colorsys.hsv_to_rgb(hue, 1, max(glow_value, control_brightness_floor))  # Use glow_value as brightness
+        color = (int(r * 255), int(g * 255), int(b * 255))
+
+        for orb in orbs:
+            # Calculate distance from the center
+            distance_from_center = np.sqrt((orb.x - window.width // 2) ** 2 + (orb.y - window.height // 2) ** 2)
+            if distance_from_center == 0:
+                distance_from_center = 1  # Prevent division by zero
+
+            max_distance = min(window.width, window.height) // 2
+
+            if ESCAPE_MODE:
+                # Escape mode: Orbs move randomly
+                orb.x += np.random.uniform(-SHAKE_INTENSITY, SHAKE_INTENSITY) * glow_value
+                orb.y += np.random.uniform(-SHAKE_INTENSITY, SHAKE_INTENSITY) * glow_value
+            else:
+                # Determine the direction towards or away from the center
+                if PULL_FROM_CENTER:
+                    direction_x = (window.width // 2 - orb.x) / distance_from_center
+                    direction_y = (window.height // 2 - orb.y) / distance_from_center
+                    orb.x += direction_x * (max_distance * (1 - glow_value)) + np.random.uniform(-SHAKE_INTENSITY, SHAKE_INTENSITY) * glow_value
+                    orb.y += direction_y * (max_distance * (1 - glow_value)) + np.random.uniform(-SHAKE_INTENSITY, SHAKE_INTENSITY) * glow_value
+                else:
+                    direction_x = (orb.x - window.width // 2) / distance_from_center
+                    direction_y = (orb.y - window.height // 2) / distance_from_center
+                    orb.x += direction_x * (control_gravity * max_distance * glow_value) + np.random.uniform(-SHAKE_INTENSITY, SHAKE_INTENSITY) * glow_value
+                    orb.y += direction_y * (control_gravity * max_distance * glow_value) + np.random.uniform(-SHAKE_INTENSITY, SHAKE_INTENSITY) * glow_value
+
+            # Ensure orbs stay within the window boundaries
+            orb.x = max(orb.radius, min(window.width - orb.radius, orb.x))
+            orb.y = max(orb.radius, min(window.height - orb.radius, orb.y))
+
+            orb.radius = 10 + glow_value * 50
+            orb.opacity = int(glow_value * 255)
+            orb.color = color
+    except Exception as e:
+        logging.error(f"Error in update: {e}")
+
+def toggle_control_menu():
+    global control_menu_visible, hue_field, speed_field, gravity_field, orbs_field, sensitivity_field, brightness_floor_field
+    control_menu_visible = not control_menu_visible
+
+    if not control_menu_visible:
+        hue_field.set_active(False)
+        speed_field.set_active(False)
+        gravity_field.set_active(False)
+        orbs_field.set_active(False)
+        sensitivity_field.set_active(False)
+        brightness_floor_field.set_active(False)
+
+def process_control_menu_click(x, y):
+    global hue_field, speed_field, gravity_field, orbs_field, sensitivity_field, brightness_floor_field, manual_hue
+
+    if hue_field.hit_test(x, y):
+        hue_field.set_active(not hue_field.active)
+        speed_field.set_active(False)
+        gravity_field.set_active(False)
+        orbs_field.set_active(False)
+        sensitivity_field.set_active(False)
+        brightness_floor_field.set_active(False)
+    elif speed_field.hit_test(x, y):
+        hue_field.set_active(False)
+        speed_field.set_active(not speed_field.active)
+        gravity_field.set_active(False)
+        orbs_field.set_active(False)
+        sensitivity_field.set_active(False)
+        brightness_floor_field.set_active(False)
+    elif gravity_field.hit_test(x, y):
+        hue_field.set_active(False)
+        speed_field.set_active(False)
+        gravity_field.set_active(not gravity_field.active)
+        orbs_field.set_active(False)
+        sensitivity_field.set_active(False)
+        brightness_floor_field.set_active(False)
+    elif orbs_field.hit_test(x, y):
+        hue_field.set_active(False)
+        speed_field.set_active(False)
+        gravity_field.set_active(False)
+        orbs_field.set_active(not orbs_field.active)
+        sensitivity_field.set_active(False)
+        brightness_floor_field.set_active(False)
+    elif sensitivity_field.hit_test(x, y):
+        hue_field.set_active(False)
+        speed_field.set_active(False)
+        gravity_field.set_active(False)
+        orbs_field.set_active(False)
+        sensitivity_field.set_active(not sensitivity_field.active)
+        brightness_floor_field.set_active(False)
+    elif brightness_floor_field.hit_test(x, y):
+        hue_field.set_active(False)
+        speed_field.set_active(False)
+        gravity_field.set_active(False)
+        orbs_field.set_active(False)
+        sensitivity_field.set_active(False)
+        brightness_floor_field.set_active(not brightness_floor_field.active)
+    elif (window.width - 70) < x < (window.width - 10) and (window.height - 30) < y < (window.height - 10):
+        toggle_control_menu()
+    elif (MENU_X + 10) < x < (MENU_X + 70) and (MENU_Y - MENU_HEIGHT - 40) < y < (MENU_Y - MENU_HEIGHT - 20):
+        apply_control_settings()
+    elif (MENU_X + 80) < x < (MENU_X + 130) and (MENU_Y - MENU_HEIGHT - 40) < y < (MENU_Y - MENU_HEIGHT - 20):
+        set_default_mode()
+
+def apply_control_settings():
+    global hue, control_hue, control_speed, control_gravity, control_orb_amount, control_sensitivity, control_brightness_floor, manual_hue, orbs
+
+    try:
+        control_hue = int(hue_field.value)
+        if control_hue == 0:
+            manual_hue = False
+        else:
+            hue = control_hue / 360.0
+            manual_hue = True
+
+        control_speed = min(float(speed_field.value), 0.9999999)  # Restrict speed value
+        control_gravity = float(gravity_field.value)
+        control_orb_amount = int(orbs_field.value)
+        control_sensitivity = float(sensitivity_field.value)
+        control_brightness_floor = float(brightness_floor_field.value) / 100.0  # Convert percentage to decimal
+
+        orbs = []
+        create_orbs(control_orb_amount)
+    except ValueError:
+        pass
+
+def set_default_mode():
+    global manual_hue, control_hue, control_speed, control_gravity, control_orb_amount, control_sensitivity, control_brightness_floor
+    manual_hue = False
+    control_hue = 0
+    control_speed = 0.0004
+    control_gravity = BLACK_HOLE_STRENGTH
+    control_orb_amount = NUM_ORBS
+    control_sensitivity = SENSITIVITY_MULTIPLIER
+    control_brightness_floor = 0.0
+    orbs = []
+    create_orbs(control_orb_amount)
+
+pyglet.clock.schedule_interval(update, 1 / 60.0)
+
+def run_visualizer(input_device_index):
+    global hue, hue_field, speed_field, gravity_field, orbs_field, sensitivity_field, brightness_floor_field
+    try:
+        hue = 0  # Initialize hue for color cycling
+
+        # Initialize editable fields
+        hue_field = EditableField("Hue (1-360):", MENU_X + LABEL_X_OFFSET, MENU_Y - ROW_HEIGHT * 1, initial_value=str(control_hue))
+        speed_field = EditableField("Speed:", MENU_X + LABEL_X_OFFSET, MENU_Y - ROW_HEIGHT * 2, initial_value=str(control_speed))
+        gravity_field = EditableField("Gravity:", MENU_X + LABEL_X_OFFSET, MENU_Y - ROW_HEIGHT * 3, initial_value=str(control_gravity))
+        orbs_field = EditableField("Orbs:", MENU_X + LABEL_X_OFFSET, MENU_Y - ROW_HEIGHT * 4, initial_value=str(control_orb_amount))
+        sensitivity_field = EditableField("Sensitivity:", MENU_X + LABEL_X_OFFSET, MENU_Y - ROW_HEIGHT * 5, initial_value=str(control_sensitivity))
+        brightness_floor_field = EditableField("Brightness Floor:", MENU_X + LABEL_X_OFFSET, MENU_Y - ROW_HEIGHT * 6, initial_value=str(int(control_brightness_floor * 100)))
+
+        create_orbs(NUM_ORBS)
+        start_audio_stream(input_device_index)
+        pyglet.app.run()
+    except Exception as e:
+        logging.error(f"Error in run_visualizer: {e}")
+        sys.exit(1)
+
+def select_device():
+    try:
+        devices = sd.query_devices()
+        input_devices = [(i, device['name']) for i, device in enumerate(devices) if device['max_input_channels'] > 0]
+
+        device_selection_window = tk.Tk()
+        device_selection_window.title("Select Input Device")
+
+        label = tk.Label(device_selection_window, text="Select the input device index for capturing system audio:")
+        label.pack(pady=10)
+
+        device_combo = ttk.Combobox(device_selection_window, values=[f"{index}: {name}" for index, name in input_devices], width=50)
+        device_combo.pack(pady=10)
+        device_combo.current(0)
+
+        def on_select():
+            selected_device_index = int(device_combo.get().split(':')[0])
+            device_selection_window.destroy()
+            run_visualizer(selected_device_index)
+
+        select_button = tk.Button(device_selection_window, text="Select", command=on_select)
+        select_button.pack(pady=20)
+
+        device_selection_window.mainloop()
+    except Exception as e:
+        logging.error(f"Failed to select device: {e}")
+        sys.exit(1)
+
+def cleanup():
+    try:
+        pyglet.app.exit()
+        if stream is not None:
+            stream.close()
+    except Exception as e:
+        logging.error(f"Error during cleanup: {e}")
+
+atexit.register(cleanup)
+
+# Main execution block
+if __name__ == "__main__":
+    select_device()

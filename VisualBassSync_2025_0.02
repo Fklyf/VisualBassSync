@@ -1,0 +1,843 @@
+import pygame
+import sounddevice as sd
+import numpy as np
+import colorsys
+import tkinter as tk
+from tkinter import ttk
+import logging
+import sys
+import time
+from queue import Queue
+import math
+from collections import deque
+from lifxlan import LifxLAN, Light, WorkflowException
+
+logging.basicConfig(level=logging.INFO)
+
+# -----------------------------
+# LIFX Constants and Setup
+# -----------------------------
+LIFX_IP = ""  # Set your LIFX IP address here
+LIFX_MAC = ""  # Set your LIFX MAC address here
+lifx = LifxLAN()
+bulb = Light(LIFX_MAC, LIFX_IP)
+
+# -----------------------------
+# CONSTANTS for Audio Processing
+# -----------------------------
+RATE = 44100
+BUFFER = 256
+NOISE_FLOOR = -80
+GAIN_FACTOR = 2
+DB_OFFSET = -10
+
+TARGET_FREQS = [35, 40, 45, 50, 55]
+PRECOMPUTED_RFFT_FREQS = np.fft.rfftfreq(BUFFER, 1.0 / RATE)
+SCALING_DIVISOR = 12
+
+SMOOTHING_WINDOW = 10
+smoothing_buffer = deque(maxlen=SMOOTHING_WINDOW)
+
+current_gain_db_smoothed = NOISE_FLOOR
+glow_value = 0.0  # Visual brightness [0,1]
+hue_value = 1.0 / 3.0  # Starting hue (green)
+
+# Modes: added "waveform2" renamed to "waveform" later.
+available_modes = ["polygon", "both", "db meters", "gravity", "waveform"]
+current_mode_index = 0
+visualization_mode = available_modes[current_mode_index]
+slider_active = False
+
+WINDOW_WIDTH = 900
+WINDOW_HEIGHT = 600
+MARGIN = 60
+METER_WIDTH = 50
+TEXT_PADDING = 8
+GLOW_WIDTH = 4
+BRIGHTNESS_FONT_SIZE = 56
+
+WAVEFORM_POINTS = 28
+WAVEFORM_SMOOTHING_FACTOR = 0.025
+WAVEFORM_SENSITIVITY = 1.0
+control_waveform_points = WAVEFORM_POINTS
+
+# Additional control variables
+manual_hue = False
+control_speed = 0.001
+control_sensitivity = 1.0
+control_brightness_floor = 0.1  # as factor between 0 and 1
+ESCAPE_MODE = False
+SHAKE_INTENSITY = 5
+waveform_buffers = []  # This should be initialized once
+
+# Global for storing the latest audio data for the waveform:
+latest_audio_data = None
+
+audio_queue = Queue(maxsize=8)
+last_update_time = time.time()
+last_packet_time = time.time()
+UPDATE_INTERVAL = 1.0 / 240.0
+PACKET_SEND_INTERVAL = 0.0111
+
+# Cube & Polygon Constants
+cube_vertices = []  # To be initialized later
+DEFAULT_SCALE_FACTOR = 100
+MAX_SCALE_FACTOR = 6.0
+ALPHA_CONSTANT = 157.50
+
+# Base dimensions for scaling menus
+BASE_WIDTH = 900
+BASE_HEIGHT = 600
+
+OFFSCREEN_WIDTH = 900
+OFFSCREEN_HEIGHT = 600
+pygame_surface = None
+
+
+def update_offscreen_surface(width, height):
+    global pygame_surface
+    pygame_surface = pygame.Surface((width, height))
+
+
+# Dummy smoothing functions (replace with your actual implementations)
+def smooth_db_value(new_db, smoothing_factor=0.2):
+    global current_gain_db_smoothed
+    current_gain_db_smoothed = smoothing_factor * new_db + (1 - smoothing_factor) * current_gain_db_smoothed
+    return current_gain_db_smoothed
+
+
+def smooth_brightness(val, min_val, rate):
+    return max(val, min_val)
+
+
+# -----------------------------
+# FFT-Based Target Frequency Detection
+# -----------------------------
+def detect_frequencies(data, rate, target_freqs):
+    try:
+        data = np.ascontiguousarray(data)
+        n = len(data)
+        if n == BUFFER:
+            fft_data = np.abs(np.fft.rfft(data))
+            freqs = PRECOMPUTED_RFFT_FREQS
+        else:
+            fft_data = np.abs(np.fft.rfft(data))
+            freqs = np.fft.rfftfreq(n, 1 / rate)
+        detected_values = []
+        for target_freq in target_freqs:
+            target_index = np.argmin(np.abs(freqs - target_freq))
+            detected_values.append(fft_data[target_index])
+        return max(detected_values)
+    except Exception as e:
+        logging.error(f"Error in detect_frequencies: {e}")
+        return 0
+
+
+# -----------------------------
+# Minimal Audio Callback
+# -----------------------------
+def audio_callback(indata, frames, time_info, status):
+    try:
+        if status:
+            logging.warning(status)
+        data = indata[:, 0].copy()
+        if not audio_queue.full():
+            audio_queue.put(data)
+    except Exception as e:
+        logging.error(f"Error in audio_callback: {e}")
+
+
+MIN_DB = -100
+current_gain_db = MIN_DB
+current_decay_rate = 1
+MAX_DECAY_RATE = 20
+DECAY_RAMP_UP_INTERVAL = 1.0
+last_decay_ramp_up_time = time.time()
+
+def apply_decay():
+    global current_gain_db, current_decay_rate, last_decay_ramp_up_time
+    if time.time() - last_decay_ramp_up_time >= DECAY_RAMP_UP_INTERVAL:
+        current_decay_rate = min(current_decay_rate + 1, MAX_DECAY_RATE)
+        last_decay_ramp_up_time = time.time()
+    current_gain_db -= current_decay_rate
+    if current_gain_db < MIN_DB:
+        current_gain_db = MIN_DB
+
+
+# -----------------------------
+# Process Audio Queue on Main Thread
+# -----------------------------
+def process_audio_queue(dt):
+    global glow_value, last_update_time, last_packet_time, hue_value, current_raw_db, current_gain_db_smoothed, smoothing_buffer, latest_audio_data
+    try:
+        while not audio_queue.empty():
+            audio_data = audio_queue.get()
+            latest_audio_data = audio_data.copy()  # Update the global latest_audio_data for waveform drawing
+            current_time = time.time()
+            detection_value = detect_frequencies(audio_data, RATE, TARGET_FREQS)
+            smoothing_buffer.append(detection_value)
+            smoothed_value = np.mean(smoothing_buffer) if len(smoothing_buffer) > 0 else 0
+
+            if smoothed_value > 0:
+                new_db = 20 * np.log10(smoothed_value) + DB_OFFSET
+            else:
+                new_db = NOISE_FLOOR
+            current_raw_db = new_db
+            current_gain_db_smoothed = smooth_db_value(new_db)
+
+            new_glow_value = min((smoothed_value / 100) * control_sensitivity, 1.0)
+            if new_glow_value < glow_value:
+                glow_value = new_glow_value
+            else:
+                glow_value += (new_glow_value - glow_value) * 0.2
+
+            last_update_time = current_time
+
+            if current_time - last_packet_time >= PACKET_SEND_INTERVAL:
+                send_lifx_color(glow_value, hue_value)
+                last_packet_time = current_time
+    except Exception as e:
+        logging.error(f"Error in process_audio_queue: {e}")
+
+
+# -----------------------------
+# Corrected LIFX Color Sending Function
+# -----------------------------
+def send_lifx_color(glow, hue, retries=3):
+    brightness = max(int(glow * control_sensitivity * 65535), int(control_brightness_floor * 65535))
+    lifx_hue = int(hue * 65535) % 65535
+    saturation = 65535
+    kelvin = 3500
+    for attempt in range(retries):
+        try:
+            bulb.set_color([lifx_hue, saturation, brightness, kelvin])
+            logging.info(f"Sent LIFX color: hue={lifx_hue}, brightness={brightness}")
+            return
+        except Exception as e:
+            logging.error(f"Error on attempt {attempt + 1}: {e}")
+            time.sleep(0.1)
+    logging.error(f"Failed to send color to LIFX after {retries} attempts")
+
+
+# -----------------------------
+# Tkinter Device Selector
+# -----------------------------
+def select_device_tk(devices_list):
+    selected_index = None
+
+    def on_select():
+        nonlocal selected_index
+        selection = combo.get()
+        selected_index = int(selection.split(":")[0])
+        root.destroy()
+
+    root = tk.Tk()
+    root.title("Select Microphone Device")
+    tk.Label(root, text="Select a microphone input device:").pack(padx=10, pady=5)
+    device_options = [f"{i}: {name}" for i, name in devices_list]
+    combo = ttk.Combobox(root, values=device_options, state="readonly", width=50)
+    combo.pack(padx=10, pady=5)
+    combo.current(0)
+    tk.Button(root, text="Select", command=on_select).pack(pady=10)
+    root.mainloop()
+    return selected_index
+
+
+all_devices = sd.query_devices()
+mic_devices = [(i, d['name']) for i, d in enumerate(all_devices) if d['max_input_channels'] > 0]
+if not mic_devices:
+    print("No microphone input devices found. Exiting.")
+    sys.exit(1)
+device_index = select_device_tk(mic_devices)
+print(f"Selected microphone device index: {device_index}")
+
+# -----------------------------
+# Start Audio Stream
+# -----------------------------
+try:
+    stream = sd.InputStream(
+        device=device_index,
+        samplerate=RATE,
+        blocksize=BUFFER,
+        channels=1,
+        callback=audio_callback
+    )
+    stream.start()
+    print("Audio stream started.")
+except Exception as e:
+    print("Failed to start audio stream:", e)
+    sys.exit(1)
+
+# -----------------------------
+# Pygame Initialization
+# -----------------------------
+pygame.init()
+pygame.font.init()
+screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.RESIZABLE)
+pygame.display.set_caption("Reactive dB Meters - Hidden Below Noise Floor")
+clock = pygame.time.Clock()
+font = pygame.font.SysFont("Arial", 20)
+brightness_font = pygame.font.SysFont("Arial", BRIGHTNESS_FONT_SIZE)
+
+
+# -----------------------------
+# Draw Meter with Glow Function
+# -----------------------------
+def draw_meter_with_glow(target, rect, draw_color, glow_width):
+    glow_surf = pygame.Surface((rect.width + 2 * glow_width, rect.height + 2 * glow_width), pygame.SRCALPHA)
+    inner_rect = pygame.Rect(glow_width, glow_width, rect.width, rect.height)
+    pygame.draw.rect(glow_surf, draw_color, inner_rect)
+    for i in range(1, glow_width + 1):
+        alpha = int(255 * (1 - i / glow_width) * 0.3)
+        glow_color = (draw_color[0], draw_color[1], draw_color[2], alpha)
+        outline_rect = inner_rect.inflate(i * 2, i * 2)
+        pygame.draw.rect(glow_surf, glow_color, outline_rect, 1)
+    target.blit(glow_surf, (rect.x - glow_width, rect.y - glow_width))
+
+
+# -----------------------------
+# Cube/Polygon Mode Functions
+# -----------------------------
+def init_cube():
+    global cube_vertices
+    cube_vertices = [
+        np.matrix([-1, -1, 1]),
+        np.matrix([1, -1, 1]),
+        np.matrix([1, 1, 1]),
+        np.matrix([-1, 1, 1]),
+        np.matrix([-1, -1, -1]),
+        np.matrix([1, -1, -1]),
+        np.matrix([1, 1, -1]),
+        np.matrix([-1, 1, -1])
+    ]
+
+
+def draw_cube(screen, center_x, center_y, rotation_x, rotation_y, rotation_z, scale, line_color):
+    # Use a 1:1 projection (identity matrix) to keep the cube undistorted:
+    projection_matrix = np.matrix([[1, 0, 0],
+                                   [0, 1, 0]])
+    projected_points = []
+    for point in cube_vertices:
+        # Apply rotations
+        rotated_point = np.dot(rotation_z, point.reshape((3, 1)))
+        rotated_point = np.dot(rotation_y, rotated_point)
+        rotated_point = np.dot(rotation_x, rotated_point)
+        # Shift the z value to avoid division by zero
+        z = rotated_point[2].item() + 5
+        if z == 0:
+            z = 0.1
+        perspective_scale = scale / z
+        # Project the 3D point onto the 2D plane without extra x scaling
+        projected_2d = np.dot(projection_matrix, rotated_point)
+        x = int(projected_2d[0].item() * perspective_scale) + center_x
+        y = int(projected_2d[1].item() * perspective_scale) + center_y
+        projected_points.append([x, y])
+        pygame.draw.circle(screen, line_color, (x, y), 5)
+
+    def connect_points(i, j):
+        pygame.draw.line(screen, line_color,
+                         (projected_points[i][0], projected_points[i][1]),
+                         (projected_points[j][0], projected_points[j][1]), 2)
+    for p in range(4):
+        connect_points(p, (p + 1) % 4)
+        connect_points(p + 4, ((p + 1) % 4) + 4)
+        connect_points(p, p + 4)
+
+def draw_polygon_mode(screen, glow_value, hue, center_x, center_y):
+    if not cube_vertices:
+        init_cube()
+    center_x, center_y = screen.get_width() // 2, screen.get_height() // 2
+    min_dimension = min(screen.get_width(), screen.get_height())
+    scale = (DEFAULT_SCALE_FACTOR * (glow_value * MAX_SCALE_FACTOR)) * (min_dimension / 800)
+    angle = pygame.time.get_ticks() * 0.0010
+    rotation_z = np.matrix([
+        [math.cos(angle), -math.sin(angle), 0],
+        [math.sin(angle), math.cos(angle), 0],
+        [0, 0, 1]
+    ])
+    rotation_y = np.matrix([
+        [math.cos(angle), 0, math.sin(angle)],
+        [0, 1, 0],
+        [-math.sin(angle), 0, math.cos(angle)]
+    ])
+    rotation_x = np.matrix([
+        [1, 0, 0],
+        [0, math.cos(angle), -math.sin(angle)],
+        [0, math.sin(angle), math.cos(angle)]
+    ])
+    brightness = max(glow_value * control_sensitivity, control_brightness_floor)
+    r, g, b = colorsys.hsv_to_rgb(hue, 1, brightness)
+    line_color = (int(r * 255), int(g * 255), int(b * 255))
+    draw_cube(screen, center_x, center_y, rotation_x, rotation_y, rotation_z, scale, line_color)
+
+def pygame_visualizer(internal_width, internal_height):
+    update_offscreen_surface(internal_width, internal_height)
+    center_x = pygame_surface.get_width() // 2
+    center_y = pygame_surface.get_height() // 2
+    draw_polygon_mode(pygame_surface, glow_value, hue_value, center_x, center_y)
+    return pygame_surface
+
+
+# -----------------------------
+# Gravity Mode Functions
+# -----------------------------
+class Orb:
+    def __init__(self, pos, radius):
+        self.pos = np.array(pos, dtype=float)
+        self.initial_pos = np.array(pos, dtype=float)
+        self.radius = radius
+        self.opacity = 255
+        self.color = (255, 255, 255)
+
+    def draw(self, surface):
+        pygame.draw.circle(surface, self.color, (int(self.pos[0]), int(self.pos[1])), int(self.radius))
+
+
+orbs = []
+
+
+def init_orbs():
+    global orbs
+    orbs = []
+    for i in range(20):
+        side = np.random.choice(["top", "bottom", "left", "right"])
+        if side == "top":
+            x = np.random.uniform(0, WINDOW_WIDTH)
+            y = 0
+        elif side == "bottom":
+            x = np.random.uniform(0, WINDOW_WIDTH)
+            y = WINDOW_HEIGHT
+        elif side == "left":
+            x = 0
+            y = np.random.uniform(0, WINDOW_HEIGHT)
+        else:
+            x = WINDOW_WIDTH
+            y = np.random.uniform(0, WINDOW_HEIGHT)
+        orbs.append(Orb((x, y), 5))
+
+
+def update_orbs():
+    global orbs, base_color
+    center_x = WINDOW_WIDTH / 2
+    center_y = WINDOW_HEIGHT / 2
+    max_distance = min(WINDOW_WIDTH, WINDOW_HEIGHT) // 2
+    remaining_orbs = []
+    for orb in orbs:
+        dx = orb.pos[0] - center_x
+        dy = orb.pos[1] - center_y
+        distance_from_center = math.sqrt(dx * dx + dy * dy)
+        if distance_from_center == 0:
+            distance_from_center = 1
+        if ESCAPE_MODE:
+            orb.pos[0] += np.random.uniform(-SHAKE_INTENSITY, SHAKE_INTENSITY) * glow_value * control_sensitivity
+            orb.pos[1] += np.random.uniform(-SHAKE_INTENSITY, SHAKE_INTENSITY) * glow_value * control_sensitivity
+        else:
+            direction_x = (center_x - orb.pos[0]) / distance_from_center
+            direction_y = (center_y - orb.pos[1]) / distance_from_center
+            orb.pos[0] += direction_x * (max_distance * (1 - glow_value)) + np.random.uniform(-SHAKE_INTENSITY,
+                                                                                              SHAKE_INTENSITY) * glow_value * control_sensitivity
+            orb.pos[1] += direction_y * (max_distance * (1 - glow_value)) + np.random.uniform(-SHAKE_INTENSITY,
+                                                                                              SHAKE_INTENSITY) * glow_value * control_sensitivity
+        orb.pos[0] = max(orb.radius, min(WINDOW_WIDTH - orb.radius, orb.pos[0]))
+        orb.pos[1] = max(orb.radius, min(WINDOW_HEIGHT - orb.radius, orb.pos[1]))
+        orb.radius = glow_value * 50 * control_sensitivity
+        orb.opacity = int(glow_value * 255 * control_sensitivity)
+        orb.color = base_color
+        if orb.radius >= 1:
+            remaining_orbs.append(orb)
+    orbs = remaining_orbs
+
+
+def draw_orbs():
+    for orb in orbs:
+        orb.draw(screen)
+
+
+# -----------------------------
+# Alternative Waveform Mode (waveform)
+# -----------------------------
+def update_waveform_buffers():
+    global waveform_buffers, control_waveform_points
+    waveform_buffers = [deque(maxlen=5) for _ in range(control_waveform_points)]
+
+def draw_waveform_mode():
+    global latest_audio_data, hue_value, control_brightness_floor, glow_value, control_sensitivity
+    try:
+        if latest_audio_data is None or len(latest_audio_data) < 2:
+            return
+
+        # Downsample and remove NaNs from the audio data.
+        waveform_data = np.nan_to_num(latest_audio_data, nan=0.0)
+        downsample_factor = max(1, len(waveform_data) // control_waveform_points)
+        downsampled_waveform = waveform_data[::downsample_factor]
+        downsampled_waveform = np.nan_to_num(downsampled_waveform, nan=0.0)
+
+        # Smooth each downsampled value using its corresponding buffer.
+        for i in range(len(downsampled_waveform)):
+            if i < len(waveform_buffers):
+                if downsampled_waveform[i] > 0:
+                    waveform_buffers[i].append(downsampled_waveform[i])
+                smoothed_val = np.mean(waveform_buffers[i])
+                downsampled_waveform[i] = (WAVEFORM_SMOOTHING_FACTOR * smoothed_val +
+                                           (1 - WAVEFORM_SMOOTHING_FACTOR) * downsampled_waveform[i])
+
+        amplitude_scale = 1.1
+        r, g, b = colorsys.hsv_to_rgb((hue_value + 0.1) % 1.0, 1,
+                                      max(glow_value * control_sensitivity * amplitude_scale,
+                                          control_brightness_floor))
+        base_color = (int(r * 255), int(g * 255), int(b * 255))
+        num_points = len(downsampled_waveform)
+        if num_points < 2:
+            return
+
+        x_step = screen.get_width() / (num_points - 1)
+        points = []
+        for i in range(num_points):
+            x = int(i * x_step)
+            y = int(screen.get_height() // 2 + downsampled_waveform[i] *
+                    screen.get_height() // 2 * control_sensitivity)
+            points.append((x, y))
+
+        # Calculate a height scaling factor so the line width scales with window size.
+        height_factor = WINDOW_HEIGHT / BASE_HEIGHT
+        # Compute the line width:
+        # When glow_value is 0, width = 1px; when glow_value is 1, width = 6px.
+        line_width = int(min(1 + glow_value * 5, 6) * height_factor)
+
+        for i in range(num_points - 1):
+            pygame.draw.line(screen, base_color, points[i], points[i + 1], line_width)
+    except Exception as e:
+        logging.error(f"Error in draw_waveform_mode: {e}")
+
+# -----------------------------
+# Main Menu: Constants & Variables
+# -----------------------------
+MENU_BUTTON_WIDTH = 100
+MENU_BUTTON_HEIGHT = 40
+MENU_BUTTON_MARGIN = 20
+
+MENU_PANEL_WIDTH = 150
+MENU_PANEL_HEIGHT = 100
+MENU_PANEL_BG_COLOR = (50, 50, 50)
+MENU_PANEL_ALPHA = 200
+
+MENU_FONT_SIZE = 18
+MENU_FONT_COLOR = (255, 255, 255)
+
+menu_button_rect = pygame.Rect(WINDOW_WIDTH - MENU_BUTTON_WIDTH - MENU_BUTTON_MARGIN,
+                               WINDOW_HEIGHT - MENU_BUTTON_HEIGHT - MENU_BUTTON_MARGIN,
+                               MENU_BUTTON_WIDTH, MENU_BUTTON_HEIGHT)
+
+menu_panel_rect = pygame.Rect(menu_button_rect.x - (MENU_PANEL_WIDTH - MENU_BUTTON_WIDTH),
+                              menu_button_rect.y - MENU_PANEL_HEIGHT,
+                              MENU_PANEL_WIDTH, MENU_PANEL_HEIGHT)
+
+mode_button_rect = pygame.Rect(menu_panel_rect.x + 10, menu_panel_rect.y + 10,
+                               MENU_PANEL_WIDTH - 20, 30)
+empty_button_rect = pygame.Rect(menu_panel_rect.x + 10, menu_panel_rect.y + 50,
+                                MENU_PANEL_WIDTH - 20, MENU_PANEL_HEIGHT - 60)
+
+menu_font = pygame.font.SysFont("Arial", MENU_FONT_SIZE)
+menu_open = False
+
+# -----------------------------
+# Menu Fade & Inline Editing Variables
+# -----------------------------
+MENU_FADE_IN_SPEED = 600
+MENU_FADE_OUT_SPEED = 600
+menu_alpha = 0
+editing_brightness_floor = False
+brightness_floor_input = ""
+
+
+def get_brightness_floor_str():
+    return f"{int(control_brightness_floor * 100)}%"
+
+
+def update_menu_fade(dt):
+    global menu_alpha, menu_open
+    if menu_open:
+        menu_alpha = min(menu_alpha + MENU_FADE_IN_SPEED * dt, 255)
+    else:
+        menu_alpha = max(menu_alpha - MENU_FADE_OUT_SPEED * dt, 0)
+
+
+
+
+def draw_menu_button():
+    button_color = (100, 100, 100, int(menu_alpha))
+    button_surf = pygame.Surface((MENU_BUTTON_WIDTH, MENU_BUTTON_HEIGHT), pygame.SRCALPHA)
+    button_surf.fill(button_color)
+    screen.blit(button_surf, (menu_button_rect.x, menu_button_rect.y))
+    button_text = menu_font.render("Menu", True, MENU_FONT_COLOR)
+    button_text.set_alpha(int(menu_alpha))
+    text_rect = button_text.get_rect(center=menu_button_rect.center)
+    screen.blit(button_text, text_rect)
+
+
+def get_slider_rect():
+    width_factor = WINDOW_WIDTH / BASE_WIDTH
+    height_factor = WINDOW_HEIGHT / BASE_HEIGHT
+    slider_x = menu_panel_rect.x + int(10 * width_factor)
+    slider_y = menu_panel_rect.y + int(60 * height_factor)
+    slider_w = MENU_PANEL_WIDTH - int(20 * width_factor)
+    slider_h = int(20 * height_factor)
+    return pygame.Rect(slider_x, slider_y, slider_w, slider_h)
+
+
+def draw_menu():
+    panel_surf = pygame.Surface((MENU_PANEL_WIDTH, MENU_PANEL_HEIGHT), pygame.SRCALPHA)
+    panel_color = (MENU_PANEL_BG_COLOR[0], MENU_PANEL_BG_COLOR[1], MENU_PANEL_BG_COLOR[2],
+                   int(MENU_PANEL_ALPHA * (menu_alpha / 255)))
+    panel_surf.fill(panel_color)
+    screen.blit(panel_surf, (menu_panel_rect.x, menu_panel_rect.y))
+
+    # Draw mode selection button
+    mode_surf = pygame.Surface((MENU_PANEL_WIDTH - 20, 30), pygame.SRCALPHA)
+    mode_surf.fill((70, 70, 70, int(menu_alpha)))
+    screen.blit(mode_surf, (mode_button_rect.x, mode_button_rect.y))
+    mode_text = menu_font.render(available_modes[current_mode_index], True, MENU_FONT_COLOR)
+    mode_text.set_alpha(int(menu_alpha))
+    mode_text_rect = mode_text.get_rect(center=mode_button_rect.center)
+    screen.blit(mode_text, mode_text_rect)
+
+    # Draw the slider area
+    slider_rect = get_slider_rect()
+    pygame.draw.rect(screen, (70, 70, 70, int(menu_alpha)), slider_rect)
+
+    if editing_brightness_floor:
+        # When editing, overlay a text box that shows the current input.
+        input_box_rect = slider_rect.copy()
+        pygame.draw.rect(screen, (50, 50, 50), input_box_rect)
+        edit_text = menu_font.render(brightness_floor_input, True, (255, 255, 0))
+        edit_text.set_alpha(int(menu_alpha))
+        edit_rect = edit_text.get_rect(center=input_box_rect.center)
+        screen.blit(edit_text, edit_rect)
+    else:
+        width_factor = WINDOW_WIDTH / BASE_WIDTH
+        height_factor = WINDOW_HEIGHT / BASE_HEIGHT
+        knob_radius = int(8 * height_factor)
+        knob_x = slider_rect.x + int(control_brightness_floor * slider_rect.width)
+        knob_y = slider_rect.y + slider_rect.height // 2
+        pygame.draw.circle(screen, (200, 200, 200), (knob_x, knob_y), knob_radius)
+        label_text = menu_font.render(f"Brightness Floor: {int(control_brightness_floor * 100)}%", True,
+                                      MENU_FONT_COLOR)
+        label_rect = label_text.get_rect(center=(slider_rect.centerx, slider_rect.y - int(10 * height_factor)))
+        screen.blit(label_text, label_rect)
+
+
+def handle_menu_events(event):
+    global menu_open, current_mode_index, visualization_mode, orbs
+    global slider_active, editing_brightness_floor, brightness_floor_input, control_brightness_floor
+    if event.type == pygame.MOUSEBUTTONDOWN:
+        mx, my = event.pos
+        if menu_button_rect.collidepoint(mx, my) or menu_panel_rect.collidepoint(mx, my):
+            menu_open = True
+            if mode_button_rect.collidepoint(mx, my):
+                current_mode_index = (current_mode_index + 1) % len(available_modes)
+                visualization_mode = available_modes[current_mode_index]
+                if visualization_mode == "gravity" and not orbs:
+                    init_orbs()
+            slider_rect = get_slider_rect()
+            if slider_rect.collidepoint(mx, my):
+                if event.button == 1:
+                    slider_active = True
+                elif event.button == 3:  # Right-click to edit
+                    editing_brightness_floor = True
+                    brightness_floor_input = ""
+        else:
+            menu_open = False
+    elif event.type == pygame.MOUSEBUTTONUP:
+        if event.button == 1:
+            slider_active = False
+    elif event.type == pygame.MOUSEMOTION:
+        if slider_active and not editing_brightness_floor:
+            slider_rect = get_slider_rect()
+            relative_x = event.pos[0] - slider_rect.x
+            new_val = relative_x / slider_rect.width
+            new_val = max(0, min(new_val, 1))
+            control_brightness_floor = new_val
+
+
+
+def handle_keyboard_events(event):
+    global editing_brightness_floor, brightness_floor_input, control_brightness_floor
+    if editing_brightness_floor:
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_RETURN:
+                # Remove any trailing "%" and parse the input as an integer.
+                input_str = brightness_floor_input.strip()
+                if input_str.endswith("%"):
+                    input_str = input_str[:-1].strip()
+                try:
+                    new_val = int(input_str)
+                    # Clamp the value between 0 and 100.
+                    new_val = max(0, min(new_val, 100))
+                    control_brightness_floor = new_val / 100.0
+                    brightness_floor_input = f"{new_val}%"
+                except ValueError:
+                    brightness_floor_input = f"{int(control_brightness_floor * 100)}%"
+                editing_brightness_floor = False
+            elif event.key == pygame.K_BACKSPACE:
+                brightness_floor_input = brightness_floor_input[:-1]
+            else:
+                if event.unicode.isdigit():
+                    brightness_floor_input += event.unicode
+                elif event.unicode == "%" and "%" not in brightness_floor_input:
+                    brightness_floor_input += event.unicode
+
+
+def update_menu_dimensions():
+    global MENU_BUTTON_WIDTH, MENU_BUTTON_HEIGHT, MENU_BUTTON_MARGIN
+    global MENU_PANEL_WIDTH, MENU_PANEL_HEIGHT
+    global menu_button_rect, menu_panel_rect, mode_button_rect, empty_button_rect
+    global MENU_FONT_SIZE, BRIGHTNESS_FONT_SIZE, menu_font, brightness_font
+
+    width_factor = WINDOW_WIDTH / BASE_WIDTH
+    height_factor = WINDOW_HEIGHT / BASE_HEIGHT
+
+    MENU_BUTTON_WIDTH = int(100 * width_factor)
+    MENU_BUTTON_HEIGHT = int(40 * height_factor)
+    MENU_BUTTON_MARGIN = int(20 * height_factor)
+    MENU_PANEL_WIDTH = int(150 * width_factor)
+    MENU_PANEL_HEIGHT = int(100 * height_factor)
+
+    MENU_FONT_SIZE = int(18 * height_factor)
+    BRIGHTNESS_FONT_SIZE = int(56 * height_factor)
+    menu_font = pygame.font.SysFont("Arial", MENU_FONT_SIZE)
+    brightness_font = pygame.font.SysFont("Arial", BRIGHTNESS_FONT_SIZE)
+
+    menu_button_rect.x = WINDOW_WIDTH - MENU_BUTTON_WIDTH - MENU_BUTTON_MARGIN
+    menu_button_rect.y = WINDOW_HEIGHT - MENU_BUTTON_HEIGHT - MENU_BUTTON_MARGIN
+    menu_button_rect.width = MENU_BUTTON_WIDTH
+    menu_button_rect.height = MENU_BUTTON_HEIGHT
+
+    menu_panel_rect.x = menu_button_rect.x - (MENU_PANEL_WIDTH - MENU_BUTTON_WIDTH)
+    menu_panel_rect.y = menu_button_rect.y - MENU_PANEL_HEIGHT
+    menu_panel_rect.width = MENU_PANEL_WIDTH
+    menu_panel_rect.height = MENU_PANEL_HEIGHT
+
+    mode_button_rect.x = menu_panel_rect.x + int(10 * width_factor)
+    mode_button_rect.y = menu_panel_rect.y + int(10 * height_factor)
+    mode_button_rect.width = MENU_PANEL_WIDTH - int(20 * width_factor)
+    mode_button_rect.height = int(30 * height_factor)
+
+    empty_button_rect.x = menu_panel_rect.x + int(10 * width_factor)
+    empty_button_rect.y = menu_panel_rect.y + int(50 * height_factor)
+    empty_button_rect.width = MENU_PANEL_WIDTH - int(20 * width_factor)
+    empty_button_rect.height = MENU_PANEL_HEIGHT - int(60 * height_factor)
+
+
+# -----------------------------
+# Main Pygame Loop
+# -----------------------------
+running = True
+update_offscreen_surface(WINDOW_WIDTH, WINDOW_HEIGHT)
+if visualization_mode == "polygon":
+    if not cube_vertices:
+        init_cube()
+elif visualization_mode == "waveform":
+    # Ensure waveform buffers are initialized before drawing the waveform.
+    update_waveform_buffers()
+    draw_waveform_mode()
+
+display_glow = 0.0
+
+while running:
+    dt = clock.get_time() / 1000.0
+    process_audio_queue(UPDATE_INTERVAL)
+    display_glow += 0.05 * (glow_value - display_glow)
+
+    mx, my = pygame.mouse.get_pos()
+    if menu_button_rect.collidepoint(mx, my) or menu_panel_rect.collidepoint(mx, my):
+        menu_open = True
+    else:
+        menu_open = False
+    update_menu_fade(dt)
+
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            running = False
+        elif event.type == pygame.VIDEORESIZE:
+            WINDOW_WIDTH, WINDOW_HEIGHT = event.size
+            screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.RESIZABLE)
+            update_offscreen_surface(WINDOW_WIDTH, WINDOW_HEIGHT)
+            update_menu_dimensions()
+        handle_menu_events(event)
+        handle_keyboard_events(event)
+
+    screen.fill((0, 0, 0))
+
+    if not manual_hue:
+        hue_value += control_speed
+        if hue_value > 1.0:
+            hue_value -= 1.0
+
+    brightness = max(glow_value * control_sensitivity, control_brightness_floor)
+    r, g, b = colorsys.hsv_to_rgb(hue_value, 1.0, brightness)
+    base_color = (int(r * 255), int(g * 255), int(b * 255))
+
+    if visualization_mode in ["both", "polygon"]:
+        poly_surface = pygame_visualizer(OFFSCREEN_WIDTH, OFFSCREEN_HEIGHT)
+        poly_scaled = pygame.transform.scale(poly_surface, (WINDOW_WIDTH, WINDOW_HEIGHT))
+        screen.blit(poly_scaled, (0, 0))
+    elif visualization_mode == "waveform":
+        draw_waveform_mode()
+
+    if visualization_mode in ["both", "db meters", "gravity"]:
+        bounding_x = MARGIN
+        bounding_y = MARGIN
+        bounding_w = WINDOW_WIDTH - 2 * MARGIN
+        bounding_h = WINDOW_HEIGHT - 2 * MARGIN
+        if bounding_w >= 0 and bounding_h >= 0:
+            volume_factor = display_glow
+            color_factor = max(display_glow, control_brightness_floor)
+            brightness_percent = round(color_factor * 100)
+            modulated_color = (int(base_color[0] * color_factor),
+                               int(base_color[1] * color_factor),
+                               int(base_color[2] * color_factor))
+            meter_fill_height = int(volume_factor * bounding_h)
+            meter_top = (bounding_y + bounding_h) - meter_fill_height
+
+            left_meter_rect = pygame.Rect(bounding_x, meter_top, METER_WIDTH, meter_fill_height)
+            right_meter_rect = pygame.Rect(bounding_x + bounding_w - METER_WIDTH, meter_top, METER_WIDTH,
+                                           meter_fill_height)
+            draw_meter_with_glow(screen, left_meter_rect, modulated_color, GLOW_WIDTH)
+            draw_meter_with_glow(screen, right_meter_rect, modulated_color, GLOW_WIDTH)
+
+            db_text_color = (int(255 * color_factor), int(255 * color_factor), int(255 * color_factor))
+            db_text = f"{current_gain_db_smoothed:.1f} dB"
+            db_surface = font.render(db_text, True, db_text_color)
+            text_y = bounding_y + bounding_h + TEXT_PADDING
+            left_text_x = left_meter_rect.x + (METER_WIDTH - db_surface.get_width()) / 2
+            right_text_x = right_meter_rect.x + (METER_WIDTH - db_surface.get_width()) / 2
+            screen.blit(db_surface, (left_text_x, text_y))
+            screen.blit(db_surface, (right_text_x, text_y))
+
+            brightness_text = f"Brightness: {brightness_percent}%"
+            brightness_surface = brightness_font.render(brightness_text, True, modulated_color)
+            brightness_x = (WINDOW_WIDTH - brightness_surface.get_width()) // 2
+            brightness_y = 10
+            screen.blit(brightness_surface, (brightness_x, brightness_y))
+
+    if visualization_mode == "gravity":
+        if glow_value > 0 and not orbs:
+            init_orbs()
+        update_orbs()
+        draw_orbs()
+
+    draw_menu_button()
+    if menu_alpha > 0:
+        draw_menu()
+
+    fps = int(clock.get_fps())
+    fps_text = font.render(f"FPS: {fps}", True, (255, 255, 255))
+    fps_rect = fps_text.get_rect(topright=(WINDOW_WIDTH - 10, 10))
+    screen.blit(fps_text, fps_rect)
+
+    pygame.display.flip()
+    clock.tick(240)
+
+stream.stop()
+stream.close()
+pygame.quit()

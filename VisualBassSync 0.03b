@@ -26,14 +26,14 @@ bulb = Light(LIFX_MAC, LIFX_IP)
 # CONSTANTS for Audio Processing
 # -----------------------------
 RATE = 44100
-BUFFER = 256
+BUFFER = 128
 NOISE_FLOOR = -100
 
 TARGET_FREQS = [35, 40, 45, 50, 55]
 PRECOMPUTED_RFFT_FREQS = np.fft.rfftfreq(BUFFER, 1.0 / RATE)
 SCALING_DIVISOR = 12
 
-SMOOTHING_WINDOW = 10
+SMOOTHING_WINDOW = 15
 smoothing_buffer = deque(maxlen=SMOOTHING_WINDOW)
 
 current_gain_db_smoothed = NOISE_FLOOR
@@ -62,12 +62,8 @@ control_waveform_points = WAVEFORM_POINTS
 
 # Additional control variables
 manual_hue = False  # When True, use fixed hue value
-control_speed = 0.001  # Only used if manual_hue is False (auto-cycle rate)
 control_sensitivity = 1.0
 control_brightness_floor = 0.1  # as factor between 0 and 1
-ESCAPE_MODE = False
-SHAKE_INTENSITY = 5
-waveform_buffers = []  # To be initialized
 
 # New globals for menu editing of hue and cycle rate:
 editing_hue = False
@@ -75,12 +71,12 @@ hue_input = ""
 editing_cycle_rate = False
 cycle_rate_input = ""
 manual_hue_value = 0.0  # 0 means auto-cycle; else fixed hue (0.0 to 1.0)
-cycle_rate = 0.001  # Hue cycle rate when auto-cycling
+cycle_rate = 0.0003  # Hue cycle rate when auto-cycling
 
 # Global for storing the latest audio data for waveform:
 latest_audio_data = None
 
-audio_queue = Queue(maxsize=4)
+audio_queue = Queue(maxsize=16)
 last_update_time = time.time()
 last_packet_time = time.time()
 UPDATE_INTERVAL = 1.0 / 240.0
@@ -92,6 +88,14 @@ DEFAULT_SCALE_FACTOR = 100
 MAX_SCALE_FACTOR = 6.0
 ALPHA_CONSTANT = 157.50
 
+#Orb Rending
+ORB_AMOUNT = 50
+ESCAPE_MODE = False
+SHAKE_INTENSITY = 5
+
+#Waveform Rending
+waveform_buffers = []  # To be initialized
+
 # Base dimensions for scaling menus
 BASE_WIDTH = 900
 BASE_HEIGHT = 600
@@ -100,6 +104,30 @@ OFFSCREEN_WIDTH = 900
 OFFSCREEN_HEIGHT = 600
 pygame_surface = None
 
+# -----------------------------
+# FPS Visibility Control
+# -----------------------------
+show_fps = True  # Initially, FPS is visible
+
+
+# -----------------------------
+# FPS Drawing Function
+# -----------------------------
+def draw_fps():
+    fps_rect = None
+    if show_fps:
+        fps = int(clock.get_fps())
+        fps_text = font.render(f"FPS: {fps}", True, (255, 255, 255))
+        fps_rect = fps_text.get_rect(topright=(WINDOW_WIDTH - 10, 10))
+
+        # Adding 10 pixels around the text for the clickable area
+        fps_rect.inflate_ip(10, 10)  # Inflate the rectangle by 10px in all directions
+
+        # Draw FPS text
+        screen.blit(fps_text, fps_rect)
+
+    # Return the clickable area (either with or without the text)
+    return fps_rect  # Always return the area, even if FPS is not visible
 
 # -----------------------------
 # Helper Functions for Scaling and Offscreen Surface
@@ -172,9 +200,9 @@ def audio_callback(indata, frames, time_info, status):
 
 MIN_DB = -100
 current_gain_db = MIN_DB
-current_decay_rate = 1
-MAX_DECAY_RATE = 20
-DECAY_RAMP_UP_INTERVAL = 1.0
+current_decay_rate = 5
+MAX_DECAY_RATE = 10
+DECAY_RAMP_UP_INTERVAL = 1
 last_decay_ramp_up_time = time.time()
 
 
@@ -191,7 +219,7 @@ def apply_decay():
 # -----------------------------
 # Process Audio Queue on Main Thread
 # -----------------------------
-BRIGHTNESS_GAIN = 2  # Boost factor for brightness/glow calculation
+BRIGHTNESS_GAIN = 1.6  # Boost factor for brightness/glow calculation
 
 
 def process_audio_queue(dt):
@@ -360,14 +388,17 @@ def update_menu_dimensions():
     menu_font = pygame.font.SysFont("Arial", MENU_FONT_SIZE)
     brightness_font = pygame.font.SysFont("Arial", BRIGHTNESS_FONT_SIZE)
 
+    # Adjusting menu button position based on window size
     menu_button_rect = pygame.Rect(WINDOW_WIDTH - MENU_BUTTON_WIDTH - MENU_BUTTON_MARGIN,
                                    WINDOW_HEIGHT - MENU_BUTTON_HEIGHT - MENU_BUTTON_MARGIN,
                                    MENU_BUTTON_WIDTH, MENU_BUTTON_HEIGHT)
+
+    # Adjusting menu panel based on button's position
     menu_panel_rect = pygame.Rect(menu_button_rect.x - (MENU_PANEL_WIDTH - MENU_BUTTON_WIDTH),
                                   menu_button_rect.y - MENU_PANEL_HEIGHT,
                                   MENU_PANEL_WIDTH, MENU_PANEL_HEIGHT)
 
-    # Common padding and field height.
+    # Field positions within the menu panel
     field_padding = int(10 * height_factor)
     field_height = int(30 * height_factor)
 
@@ -388,14 +419,6 @@ def update_menu_dimensions():
                                          MENU_PANEL_WIDTH - 2 * field_padding,
                                          field_height)
 
-    globals()['menu_button_rect'] = menu_button_rect
-    globals()['menu_panel_rect'] = menu_panel_rect
-    globals()['mode_field_rect'] = mode_field_rect
-    globals()['hue_field_rect'] = hue_field_rect
-    globals()['cycle_rate_field_rect'] = cycle_rate_field_rect
-    globals()['brightness_slider_rect'] = brightness_slider_rect
-
-
 # -----------------------------
 # Pygame Initialization & Setup
 # -----------------------------
@@ -407,9 +430,9 @@ clock = pygame.time.Clock()
 font = pygame.font.SysFont("Arial", 20)
 brightness_font = pygame.font.SysFont("Arial", BRIGHTNESS_FONT_SIZE)
 
+# Initialize menu dimensions at startup (manual call here)
 update_menu_dimensions()  # Initialize menu dimensions at startup
 update_meter_dimensions()  # Initialize meter dimensions at startup
-
 
 # -----------------------------
 # Cube/Polygon / Gravity / Waveform Functions (unchanged)
@@ -523,7 +546,7 @@ orbs = []
 def init_orbs():
     global orbs
     orbs = []
-    for i in range(20):
+    for i in range(ORB_AMOUNT):
         side = np.random.choice(["top", "bottom", "left", "right"])
         if side == "top":
             x = np.random.uniform(0, WINDOW_WIDTH)
@@ -658,9 +681,10 @@ def draw_menu():
     mode_text_rect = mode_text.get_rect(center=mode_field_rect.center)
     screen.blit(mode_text, mode_text_rect)
 
-    # Draw Hue Field
+    # Hue Field
     pygame.draw.rect(screen, (70, 70, 70, int(menu_alpha)), hue_field_rect)
-    hue_display = hue_input if editing_hue else f"Hue (0 for auto): {manual_hue_value:.2f}"
+    # Display either user input or the actual hue value (in manual or automatic mode)
+    hue_display = hue_input if editing_hue else f"Hue (0 for auto): {manual_hue_value:.2f}"  # Display as 0.00 format
     hue_text = menu_font.render(hue_display, True, MENU_FONT_COLOR)
     hue_text.set_alpha(int(menu_alpha))
     hue_text_rect = hue_text.get_rect(center=hue_field_rect.center)
@@ -699,6 +723,7 @@ def handle_menu_events(event):
     global slider_active, editing_brightness_floor, brightness_floor_input
     global editing_hue, hue_input, editing_cycle_rate, cycle_rate_input
     global manual_hue_value, cycle_rate, control_brightness_floor
+    global show_fps  # Add this global flag for FPS visibility
 
     if event.type == pygame.MOUSEBUTTONDOWN:
         mx, my = event.pos
@@ -731,6 +756,12 @@ def handle_menu_events(event):
         else:
             menu_open = False
 
+        # Check if click is inside the expanded FPS area (even if it's hidden)
+        fps_rect = draw_fps()  # Get the FPS area (draw and get the clickable rect)
+        if fps_rect and fps_rect.collidepoint(mx, my):
+            show_fps = not show_fps  # Toggle FPS visibility
+            print("[DEBUG] FPS visibility toggled!")
+
     elif event.type == pygame.MOUSEBUTTONUP:
         if event.button == 1:
             slider_active = False
@@ -747,10 +778,20 @@ def handle_menu_events(event):
             print(f"[DEBUG] control_brightness_floor updated to: {control_brightness_floor}")
 
 
+# -----------------------------
+# Handle Keyboard Events (Including F2 for FPS Toggle)
+# -----------------------------
 def handle_keyboard_events(event):
     global editing_brightness_floor, brightness_floor_input, control_brightness_floor
     global editing_hue, hue_input, manual_hue_value, manual_hue
     global editing_cycle_rate, cycle_rate_input, cycle_rate
+    global show_fps  # Global flag for FPS visibility
+
+    # Handling FPS visibility toggle via F2 key
+    if event.type == pygame.KEYDOWN:
+        if event.key == pygame.K_F2:
+            show_fps = not show_fps  # Toggle FPS visibility when F2 is pressed
+            print("[DEBUG] FPS visibility toggled by F2!")
 
     # Brightness editing
     if editing_brightness_floor:
@@ -779,20 +820,23 @@ def handle_keyboard_events(event):
     if editing_hue:
         if event.type == pygame.KEYDOWN:
             if event.key == pygame.K_RETURN:
+                # If "Enter" is pressed, finalize the hue input
                 s = hue_input.strip()
                 try:
                     val = float(s)
-                    manual_hue_value = val
-                    manual_hue = (val != 0)
+                    # Ensure hue is clamped between 0.0 and 1.0 for HSV range
+                    val = max(0.0, min(val, 1.0))  # Clamp the value between 0 and 1
+                    manual_hue_value = val  # Store the hue as a float between 0.0 and 1.0
+                    manual_hue = (val != 0)  # Set flag to check if it's manual hue
                     print(f"[DEBUG] Manual hue set to {manual_hue_value} (manual_hue={manual_hue})")
                 except ValueError:
                     print("[DEBUG] Invalid hue input!")
-                editing_hue = False
+                editing_hue = False  # Stop editing after hitting Enter
             elif event.key == pygame.K_BACKSPACE:
-                hue_input = hue_input[:-1]
+                hue_input = hue_input[:-1]  # Backspace support
             else:
                 if event.unicode.isdigit() or event.unicode == '.':
-                    hue_input += event.unicode
+                    hue_input += event.unicode  # Append input character
 
     # Cycle rate editing
     if editing_cycle_rate:
@@ -813,7 +857,6 @@ def handle_keyboard_events(event):
                     cycle_rate_input += event.unicode
 
 
-
 # -----------------------------
 # Main Loop
 # -----------------------------
@@ -828,6 +871,9 @@ elif visualization_mode == "waveform":
 
 display_glow = 0.0
 
+# -----------------------------
+# Main Loop
+# -----------------------------
 while running:
     dt = clock.get_time() / 1000.0
     process_audio_queue(UPDATE_INTERVAL)
@@ -919,10 +965,8 @@ while running:
     if menu_alpha > 0:
         draw_menu()
 
-    fps = int(clock.get_fps())
-    fps_text = font.render(f"FPS: {fps}", True, (255, 255, 255))
-    fps_rect = fps_text.get_rect(topright=(WINDOW_WIDTH - 10, 10))
-    screen.blit(fps_text, fps_rect)
+    # Draw the FPS in the top-right corner
+    fps_rect = draw_fps()  # Call the updated function to draw FPS and get the clickable area
 
     pygame.display.flip()
     clock.tick(240)

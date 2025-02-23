@@ -17,8 +17,8 @@ logging.basicConfig(level=logging.INFO)
 # -----------------------------
 # LIFX Constants and Setup
 # -----------------------------
-LIFX_IP = ""  # Set your LIFX IP address here
-LIFX_MAC = ""  # Set your LIFX MAC address here
+LIFX_IP = "192.168.1.2"  # Set your LIFX IP address here
+LIFX_MAC = "D0:73:D5:2C:F7:7E"  # Set your LIFX MAC address here
 lifx = LifxLAN()
 bulb = Light(LIFX_MAC, LIFX_IP)
 
@@ -27,9 +27,7 @@ bulb = Light(LIFX_MAC, LIFX_IP)
 # -----------------------------
 RATE = 44100
 BUFFER = 256
-NOISE_FLOOR = -80
-GAIN_FACTOR = 2
-DB_OFFSET = -10
+NOISE_FLOOR = -100
 
 TARGET_FREQS = [35, 40, 45, 50, 55]
 PRECOMPUTED_RFFT_FREQS = np.fft.rfftfreq(BUFFER, 1.0 / RATE)
@@ -39,10 +37,10 @@ SMOOTHING_WINDOW = 10
 smoothing_buffer = deque(maxlen=SMOOTHING_WINDOW)
 
 current_gain_db_smoothed = NOISE_FLOOR
-glow_value = 0.0  # Visual brightness [0,1]
+glow_value = 0.0  # Visual brightness (0 to 1)
 hue_value = 1.0 / 3.0  # Starting hue (green)
 
-# Modes: added "waveform2" renamed to "waveform" later.
+# Modes
 available_modes = ["polygon", "both", "db meters", "gravity", "waveform"]
 current_mode_index = 0
 visualization_mode = available_modes[current_mode_index]
@@ -50,6 +48,7 @@ slider_active = False
 
 WINDOW_WIDTH = 900
 WINDOW_HEIGHT = 600
+# These globals will be recalculated on resize:
 MARGIN = 60
 METER_WIDTH = 50
 TEXT_PADDING = 8
@@ -62,18 +61,26 @@ WAVEFORM_SENSITIVITY = 1.0
 control_waveform_points = WAVEFORM_POINTS
 
 # Additional control variables
-manual_hue = False
-control_speed = 0.001
+manual_hue = False  # When True, use fixed hue value
+control_speed = 0.001  # Only used if manual_hue is False (auto-cycle rate)
 control_sensitivity = 1.0
 control_brightness_floor = 0.1  # as factor between 0 and 1
 ESCAPE_MODE = False
 SHAKE_INTENSITY = 5
-waveform_buffers = []  # This should be initialized once
+waveform_buffers = []  # To be initialized
 
-# Global for storing the latest audio data for the waveform:
+# New globals for menu editing of hue and cycle rate:
+editing_hue = False
+hue_input = ""
+editing_cycle_rate = False
+cycle_rate_input = ""
+manual_hue_value = 0.0  # 0 means auto-cycle; else fixed hue (0.0 to 1.0)
+cycle_rate = 0.001  # Hue cycle rate when auto-cycling
+
+# Global for storing the latest audio data for waveform:
 latest_audio_data = None
 
-audio_queue = Queue(maxsize=8)
+audio_queue = Queue(maxsize=4)
 last_update_time = time.time()
 last_packet_time = time.time()
 UPDATE_INTERVAL = 1.0 / 240.0
@@ -94,12 +101,28 @@ OFFSCREEN_HEIGHT = 600
 pygame_surface = None
 
 
+# -----------------------------
+# Helper Functions for Scaling and Offscreen Surface
+# -----------------------------
 def update_offscreen_surface(width, height):
     global pygame_surface
     pygame_surface = pygame.Surface((width, height))
 
 
-# Dummy smoothing functions (replace with your actual implementations)
+def update_meter_dimensions():
+    global MARGIN, METER_WIDTH, TEXT_PADDING, GLOW_WIDTH
+    width_factor = WINDOW_WIDTH / BASE_WIDTH
+    height_factor = WINDOW_HEIGHT / BASE_HEIGHT
+    scale = min(width_factor, height_factor)
+    MARGIN = int(60 * scale)
+    METER_WIDTH = int(50 * scale)
+    TEXT_PADDING = int(8 * scale)
+    GLOW_WIDTH = int(4 * scale)
+
+
+# -----------------------------
+# Dummy Smoothing Functions
+# -----------------------------
 def smooth_db_value(new_db, smoothing_factor=0.2):
     global current_gain_db_smoothed
     current_gain_db_smoothed = smoothing_factor * new_db + (1 - smoothing_factor) * current_gain_db_smoothed
@@ -154,6 +177,7 @@ MAX_DECAY_RATE = 20
 DECAY_RAMP_UP_INTERVAL = 1.0
 last_decay_ramp_up_time = time.time()
 
+
 def apply_decay():
     global current_gain_db, current_decay_rate, last_decay_ramp_up_time
     if time.time() - last_decay_ramp_up_time >= DECAY_RAMP_UP_INTERVAL:
@@ -167,31 +191,34 @@ def apply_decay():
 # -----------------------------
 # Process Audio Queue on Main Thread
 # -----------------------------
+BRIGHTNESS_GAIN = 2  # Boost factor for brightness/glow calculation
+
+
 def process_audio_queue(dt):
-    global glow_value, last_update_time, last_packet_time, hue_value, current_raw_db, current_gain_db_smoothed, smoothing_buffer, latest_audio_data
+    global waveform_data, latest_audio_data, glow_value, last_update_time, last_packet_time, hue_value
+    global current_gain_db, smoothing_buffer
     try:
         while not audio_queue.empty():
             audio_data = audio_queue.get()
-            latest_audio_data = audio_data.copy()  # Update the global latest_audio_data for waveform drawing
+            waveform_data = audio_data
+            latest_audio_data = audio_data.copy()
+
             current_time = time.time()
+
+            # dB reading based on peak amplitude (for display)
+            peak_value = np.max(np.abs(audio_data))
+            display_db = 20 * np.log10(peak_value) if peak_value > 0 else -100
+            smooth_db_value(display_db)
+
+            # Brightness/glow from FFT-based detection
             detection_value = detect_frequencies(audio_data, RATE, TARGET_FREQS)
             smoothing_buffer.append(detection_value)
-            smoothed_value = np.mean(smoothing_buffer) if len(smoothing_buffer) > 0 else 0
+            smoothed_value = np.mean(smoothing_buffer) if smoothing_buffer else 0
+            new_glow_value = min((smoothed_value * BRIGHTNESS_GAIN / 100) * control_sensitivity, 1.0)
 
-            if smoothed_value > 0:
-                new_db = 20 * np.log10(smoothed_value) + DB_OFFSET
-            else:
-                new_db = NOISE_FLOOR
-            current_raw_db = new_db
-            current_gain_db_smoothed = smooth_db_value(new_db)
-
-            new_glow_value = min((smoothed_value / 100) * control_sensitivity, 1.0)
-            if new_glow_value < glow_value:
-                glow_value = new_glow_value
-            else:
-                glow_value += (new_glow_value - glow_value) * 0.2
-
-            last_update_time = current_time
+            if current_time - last_update_time >= UPDATE_INTERVAL:
+                last_update_time = current_time
+            glow_value = new_glow_value
 
             if current_time - last_packet_time >= PACKET_SEND_INTERVAL:
                 send_lifx_color(glow_value, hue_value)
@@ -269,7 +296,108 @@ except Exception as e:
     sys.exit(1)
 
 # -----------------------------
-# Pygame Initialization
+# Menu Constants & Variables
+# -----------------------------
+MENU_BUTTON_WIDTH = 100
+MENU_BUTTON_HEIGHT = 40
+MENU_BUTTON_MARGIN = 20
+
+MENU_PANEL_WIDTH = 150
+MENU_PANEL_HEIGHT = 160  # Increased to accommodate 4 fields
+MENU_PANEL_BG_COLOR = (50, 50, 50)
+MENU_PANEL_ALPHA = 200
+
+MENU_FONT_SIZE = 18
+MENU_FONT_COLOR = (255, 255, 255)
+
+# These rects will be updated on resize.
+menu_button_rect = pygame.Rect(0, 0, 0, 0)
+menu_panel_rect = pygame.Rect(0, 0, 0, 0)
+# Define four fields: Mode, Hue, Cycle Rate, Brightness Slider.
+mode_field_rect = pygame.Rect(0, 0, 0, 0)
+hue_field_rect = pygame.Rect(0, 0, 0, 0)
+cycle_rate_field_rect = pygame.Rect(0, 0, 0, 0)
+brightness_slider_rect = pygame.Rect(0, 0, 0, 0)
+
+menu_font = None
+brightness_font = None
+menu_open = False
+
+# -----------------------------
+# Menu Fade & Editing Variables
+# -----------------------------
+MENU_FADE_IN_SPEED = 600
+MENU_FADE_OUT_SPEED = 600
+menu_alpha = 0
+editing_brightness_floor = False
+brightness_floor_input = ""
+editing_hue = False
+hue_input = ""
+editing_cycle_rate = False
+cycle_rate_input = ""
+
+
+# -----------------------------
+# Update Menu & Meter Dimensions
+# -----------------------------
+def update_menu_dimensions():
+    global MENU_BUTTON_WIDTH, MENU_BUTTON_HEIGHT, MENU_BUTTON_MARGIN
+    global MENU_PANEL_WIDTH, MENU_PANEL_HEIGHT
+    global menu_button_rect, menu_panel_rect, mode_field_rect, hue_field_rect, cycle_rate_field_rect, brightness_slider_rect
+    global MENU_FONT_SIZE, BRIGHTNESS_FONT_SIZE, menu_font, brightness_font
+
+    width_factor = WINDOW_WIDTH / BASE_WIDTH
+    height_factor = WINDOW_HEIGHT / BASE_HEIGHT
+
+    MENU_BUTTON_WIDTH = int(100 * width_factor)
+    MENU_BUTTON_HEIGHT = int(40 * height_factor)
+    MENU_BUTTON_MARGIN = int(20 * height_factor)
+    MENU_PANEL_WIDTH = int(150 * width_factor)
+    MENU_PANEL_HEIGHT = int(160 * height_factor)
+
+    MENU_FONT_SIZE = int(18 * height_factor)
+    BRIGHTNESS_FONT_SIZE = int(56 * height_factor)
+    menu_font = pygame.font.SysFont("Arial", MENU_FONT_SIZE)
+    brightness_font = pygame.font.SysFont("Arial", BRIGHTNESS_FONT_SIZE)
+
+    menu_button_rect = pygame.Rect(WINDOW_WIDTH - MENU_BUTTON_WIDTH - MENU_BUTTON_MARGIN,
+                                   WINDOW_HEIGHT - MENU_BUTTON_HEIGHT - MENU_BUTTON_MARGIN,
+                                   MENU_BUTTON_WIDTH, MENU_BUTTON_HEIGHT)
+    menu_panel_rect = pygame.Rect(menu_button_rect.x - (MENU_PANEL_WIDTH - MENU_BUTTON_WIDTH),
+                                  menu_button_rect.y - MENU_PANEL_HEIGHT,
+                                  MENU_PANEL_WIDTH, MENU_PANEL_HEIGHT)
+
+    # Common padding and field height.
+    field_padding = int(10 * height_factor)
+    field_height = int(30 * height_factor)
+
+    mode_field_rect = pygame.Rect(menu_panel_rect.x + field_padding,
+                                  menu_panel_rect.y + field_padding,
+                                  MENU_PANEL_WIDTH - 2 * field_padding,
+                                  field_height)
+    hue_field_rect = pygame.Rect(menu_panel_rect.x + field_padding,
+                                 mode_field_rect.bottom + field_padding,
+                                 MENU_PANEL_WIDTH - 2 * field_padding,
+                                 field_height)
+    cycle_rate_field_rect = pygame.Rect(menu_panel_rect.x + field_padding,
+                                        hue_field_rect.bottom + field_padding,
+                                        MENU_PANEL_WIDTH - 2 * field_padding,
+                                        field_height)
+    brightness_slider_rect = pygame.Rect(menu_panel_rect.x + field_padding,
+                                         cycle_rate_field_rect.bottom + field_padding,
+                                         MENU_PANEL_WIDTH - 2 * field_padding,
+                                         field_height)
+
+    globals()['menu_button_rect'] = menu_button_rect
+    globals()['menu_panel_rect'] = menu_panel_rect
+    globals()['mode_field_rect'] = mode_field_rect
+    globals()['hue_field_rect'] = hue_field_rect
+    globals()['cycle_rate_field_rect'] = cycle_rate_field_rect
+    globals()['brightness_slider_rect'] = brightness_slider_rect
+
+
+# -----------------------------
+# Pygame Initialization & Setup
 # -----------------------------
 pygame.init()
 pygame.font.init()
@@ -279,9 +407,12 @@ clock = pygame.time.Clock()
 font = pygame.font.SysFont("Arial", 20)
 brightness_font = pygame.font.SysFont("Arial", BRIGHTNESS_FONT_SIZE)
 
+update_menu_dimensions()  # Initialize menu dimensions at startup
+update_meter_dimensions()  # Initialize meter dimensions at startup
+
 
 # -----------------------------
-# Draw Meter with Glow Function
+# Cube/Polygon / Gravity / Waveform Functions (unchanged)
 # -----------------------------
 def draw_meter_with_glow(target, rect, draw_color, glow_width):
     glow_surf = pygame.Surface((rect.width + 2 * glow_width, rect.height + 2 * glow_width), pygame.SRCALPHA)
@@ -295,9 +426,6 @@ def draw_meter_with_glow(target, rect, draw_color, glow_width):
     target.blit(glow_surf, (rect.x - glow_width, rect.y - glow_width))
 
 
-# -----------------------------
-# Cube/Polygon Mode Functions
-# -----------------------------
 def init_cube():
     global cube_vertices
     cube_vertices = [
@@ -313,21 +441,17 @@ def init_cube():
 
 
 def draw_cube(screen, center_x, center_y, rotation_x, rotation_y, rotation_z, scale, line_color):
-    # Use a 1:1 projection (identity matrix) to keep the cube undistorted:
     projection_matrix = np.matrix([[1, 0, 0],
                                    [0, 1, 0]])
     projected_points = []
     for point in cube_vertices:
-        # Apply rotations
         rotated_point = np.dot(rotation_z, point.reshape((3, 1)))
         rotated_point = np.dot(rotation_y, rotated_point)
         rotated_point = np.dot(rotation_x, rotated_point)
-        # Shift the z value to avoid division by zero
         z = rotated_point[2].item() + 5
         if z == 0:
             z = 0.1
         perspective_scale = scale / z
-        # Project the 3D point onto the 2D plane without extra x scaling
         projected_2d = np.dot(projection_matrix, rotated_point)
         x = int(projected_2d[0].item() * perspective_scale) + center_x
         y = int(projected_2d[1].item() * perspective_scale) + center_y
@@ -338,10 +462,12 @@ def draw_cube(screen, center_x, center_y, rotation_x, rotation_y, rotation_z, sc
         pygame.draw.line(screen, line_color,
                          (projected_points[i][0], projected_points[i][1]),
                          (projected_points[j][0], projected_points[j][1]), 2)
+
     for p in range(4):
         connect_points(p, (p + 1) % 4)
         connect_points(p + 4, ((p + 1) % 4) + 4)
         connect_points(p, p + 4)
+
 
 def draw_polygon_mode(screen, glow_value, hue, center_x, center_y):
     if not cube_vertices:
@@ -370,6 +496,7 @@ def draw_polygon_mode(screen, glow_value, hue, center_x, center_y):
     line_color = (int(r * 255), int(g * 255), int(b * 255))
     draw_cube(screen, center_x, center_y, rotation_x, rotation_y, rotation_z, scale, line_color)
 
+
 def pygame_visualizer(internal_width, internal_height):
     update_offscreen_surface(internal_width, internal_height)
     center_x = pygame_surface.get_width() // 2
@@ -378,9 +505,6 @@ def pygame_visualizer(internal_width, internal_height):
     return pygame_surface
 
 
-# -----------------------------
-# Gravity Mode Functions
-# -----------------------------
 class Orb:
     def __init__(self, pos, radius):
         self.pos = np.array(pos, dtype=float)
@@ -453,26 +577,20 @@ def draw_orbs():
         orb.draw(screen)
 
 
-# -----------------------------
-# Alternative Waveform Mode (waveform)
-# -----------------------------
 def update_waveform_buffers():
     global waveform_buffers, control_waveform_points
     waveform_buffers = [deque(maxlen=5) for _ in range(control_waveform_points)]
+
 
 def draw_waveform_mode():
     global latest_audio_data, hue_value, control_brightness_floor, glow_value, control_sensitivity
     try:
         if latest_audio_data is None or len(latest_audio_data) < 2:
             return
-
-        # Downsample and remove NaNs from the audio data.
         waveform_data = np.nan_to_num(latest_audio_data, nan=0.0)
         downsample_factor = max(1, len(waveform_data) // control_waveform_points)
         downsampled_waveform = waveform_data[::downsample_factor]
         downsampled_waveform = np.nan_to_num(downsampled_waveform, nan=0.0)
-
-        # Smooth each downsampled value using its corresponding buffer.
         for i in range(len(downsampled_waveform)):
             if i < len(waveform_buffers):
                 if downsampled_waveform[i] > 0:
@@ -480,7 +598,6 @@ def draw_waveform_mode():
                 smoothed_val = np.mean(waveform_buffers[i])
                 downsampled_waveform[i] = (WAVEFORM_SMOOTHING_FACTOR * smoothed_val +
                                            (1 - WAVEFORM_SMOOTHING_FACTOR) * downsampled_waveform[i])
-
         amplitude_scale = 1.1
         r, g, b = colorsys.hsv_to_rgb((hue_value + 0.1) % 1.0, 1,
                                       max(glow_value * control_sensitivity * amplitude_scale,
@@ -489,79 +606,30 @@ def draw_waveform_mode():
         num_points = len(downsampled_waveform)
         if num_points < 2:
             return
-
         x_step = screen.get_width() / (num_points - 1)
         points = []
         for i in range(num_points):
             x = int(i * x_step)
-            y = int(screen.get_height() // 2 + downsampled_waveform[i] *
-                    screen.get_height() // 2 * control_sensitivity)
+            y = int(screen.get_height() // 2 + downsampled_waveform[i] * screen.get_height() // 2 * control_sensitivity)
             points.append((x, y))
-
-        # Calculate a height scaling factor so the line width scales with window size.
         height_factor = WINDOW_HEIGHT / BASE_HEIGHT
-        # Compute the line width:
-        # When glow_value is 0, width = 1px; when glow_value is 1, width = 6px.
         line_width = int(min(1 + glow_value * 5, 6) * height_factor)
-
         for i in range(num_points - 1):
             pygame.draw.line(screen, base_color, points[i], points[i + 1], line_width)
     except Exception as e:
         logging.error(f"Error in draw_waveform_mode: {e}")
 
-# -----------------------------
-# Main Menu: Constants & Variables
-# -----------------------------
-MENU_BUTTON_WIDTH = 100
-MENU_BUTTON_HEIGHT = 40
-MENU_BUTTON_MARGIN = 20
-
-MENU_PANEL_WIDTH = 150
-MENU_PANEL_HEIGHT = 100
-MENU_PANEL_BG_COLOR = (50, 50, 50)
-MENU_PANEL_ALPHA = 200
-
-MENU_FONT_SIZE = 18
-MENU_FONT_COLOR = (255, 255, 255)
-
-menu_button_rect = pygame.Rect(WINDOW_WIDTH - MENU_BUTTON_WIDTH - MENU_BUTTON_MARGIN,
-                               WINDOW_HEIGHT - MENU_BUTTON_HEIGHT - MENU_BUTTON_MARGIN,
-                               MENU_BUTTON_WIDTH, MENU_BUTTON_HEIGHT)
-
-menu_panel_rect = pygame.Rect(menu_button_rect.x - (MENU_PANEL_WIDTH - MENU_BUTTON_WIDTH),
-                              menu_button_rect.y - MENU_PANEL_HEIGHT,
-                              MENU_PANEL_WIDTH, MENU_PANEL_HEIGHT)
-
-mode_button_rect = pygame.Rect(menu_panel_rect.x + 10, menu_panel_rect.y + 10,
-                               MENU_PANEL_WIDTH - 20, 30)
-empty_button_rect = pygame.Rect(menu_panel_rect.x + 10, menu_panel_rect.y + 50,
-                                MENU_PANEL_WIDTH - 20, MENU_PANEL_HEIGHT - 60)
-
-menu_font = pygame.font.SysFont("Arial", MENU_FONT_SIZE)
-menu_open = False
 
 # -----------------------------
-# Menu Fade & Inline Editing Variables
+# Menu Drawing & Handling Functions
 # -----------------------------
-MENU_FADE_IN_SPEED = 600
-MENU_FADE_OUT_SPEED = 600
-menu_alpha = 0
-editing_brightness_floor = False
-brightness_floor_input = ""
-
-
-def get_brightness_floor_str():
-    return f"{int(control_brightness_floor * 100)}%"
-
-
 def update_menu_fade(dt):
     global menu_alpha, menu_open
+    # Simple fade in/out based on whether the menu is open.
     if menu_open:
         menu_alpha = min(menu_alpha + MENU_FADE_IN_SPEED * dt, 255)
     else:
         menu_alpha = max(menu_alpha - MENU_FADE_OUT_SPEED * dt, 0)
-
-
 
 
 def draw_menu_button():
@@ -575,106 +643,127 @@ def draw_menu_button():
     screen.blit(button_text, text_rect)
 
 
-def get_slider_rect():
-    width_factor = WINDOW_WIDTH / BASE_WIDTH
-    height_factor = WINDOW_HEIGHT / BASE_HEIGHT
-    slider_x = menu_panel_rect.x + int(10 * width_factor)
-    slider_y = menu_panel_rect.y + int(60 * height_factor)
-    slider_w = MENU_PANEL_WIDTH - int(20 * width_factor)
-    slider_h = int(20 * height_factor)
-    return pygame.Rect(slider_x, slider_y, slider_w, slider_h)
-
-
 def draw_menu():
+    # Draw panel background
     panel_surf = pygame.Surface((MENU_PANEL_WIDTH, MENU_PANEL_HEIGHT), pygame.SRCALPHA)
     panel_color = (MENU_PANEL_BG_COLOR[0], MENU_PANEL_BG_COLOR[1], MENU_PANEL_BG_COLOR[2],
                    int(MENU_PANEL_ALPHA * (menu_alpha / 255)))
     panel_surf.fill(panel_color)
     screen.blit(panel_surf, (menu_panel_rect.x, menu_panel_rect.y))
 
-    # Draw mode selection button
-    mode_surf = pygame.Surface((MENU_PANEL_WIDTH - 20, 30), pygame.SRCALPHA)
-    mode_surf.fill((70, 70, 70, int(menu_alpha)))
-    screen.blit(mode_surf, (mode_button_rect.x, mode_button_rect.y))
+    # Draw Mode Field (top)
+    pygame.draw.rect(screen, (70, 70, 70, int(menu_alpha)), mode_field_rect)
     mode_text = menu_font.render(available_modes[current_mode_index], True, MENU_FONT_COLOR)
     mode_text.set_alpha(int(menu_alpha))
-    mode_text_rect = mode_text.get_rect(center=mode_button_rect.center)
+    mode_text_rect = mode_text.get_rect(center=mode_field_rect.center)
     screen.blit(mode_text, mode_text_rect)
 
-    # Draw the slider area
-    slider_rect = get_slider_rect()
-    pygame.draw.rect(screen, (70, 70, 70, int(menu_alpha)), slider_rect)
+    # Draw Hue Field
+    pygame.draw.rect(screen, (70, 70, 70, int(menu_alpha)), hue_field_rect)
+    hue_display = hue_input if editing_hue else f"Hue (0 for auto): {manual_hue_value:.2f}"
+    hue_text = menu_font.render(hue_display, True, MENU_FONT_COLOR)
+    hue_text.set_alpha(int(menu_alpha))
+    hue_text_rect = hue_text.get_rect(center=hue_field_rect.center)
+    screen.blit(hue_text, hue_text_rect)
 
+    # Draw Cycle Rate Field
+    pygame.draw.rect(screen, (70, 70, 70, int(menu_alpha)), cycle_rate_field_rect)
+    cycle_rate_display = cycle_rate_input if editing_cycle_rate else f"Cycle Rate: {cycle_rate:.4f}"
+    cycle_rate_text = menu_font.render(cycle_rate_display, True, MENU_FONT_COLOR)
+    cycle_rate_text.set_alpha(int(menu_alpha))
+    cycle_rate_text_rect = cycle_rate_text.get_rect(center=cycle_rate_field_rect.center)
+    screen.blit(cycle_rate_text, cycle_rate_text_rect)
+
+    # Draw Brightness Slider Field (bottom)
+    pygame.draw.rect(screen, (70, 70, 70, int(menu_alpha)), brightness_slider_rect)
     if editing_brightness_floor:
-        # When editing, overlay a text box that shows the current input.
-        input_box_rect = slider_rect.copy()
+        input_box_rect = brightness_slider_rect.copy()
         pygame.draw.rect(screen, (50, 50, 50), input_box_rect)
         edit_text = menu_font.render(brightness_floor_input, True, (255, 255, 0))
         edit_text.set_alpha(int(menu_alpha))
         edit_rect = edit_text.get_rect(center=input_box_rect.center)
         screen.blit(edit_text, edit_rect)
     else:
-        width_factor = WINDOW_WIDTH / BASE_WIDTH
-        height_factor = WINDOW_HEIGHT / BASE_HEIGHT
-        knob_radius = int(8 * height_factor)
-        knob_x = slider_rect.x + int(control_brightness_floor * slider_rect.width)
-        knob_y = slider_rect.y + slider_rect.height // 2
+        hf = WINDOW_HEIGHT / BASE_HEIGHT
+        knob_radius = int(8 * hf)
+        knob_x = brightness_slider_rect.x + int(control_brightness_floor * brightness_slider_rect.width)
+        knob_y = brightness_slider_rect.y + brightness_slider_rect.height // 2
         pygame.draw.circle(screen, (200, 200, 200), (knob_x, knob_y), knob_radius)
-        label_text = menu_font.render(f"Brightness Floor: {int(control_brightness_floor * 100)}%", True,
-                                      MENU_FONT_COLOR)
-        label_rect = label_text.get_rect(center=(slider_rect.centerx, slider_rect.y - int(10 * height_factor)))
+        label_text = menu_font.render(f"Brightness Floor: {int(control_brightness_floor * 100)}%", True, MENU_FONT_COLOR)
+        label_rect = label_text.get_rect(center=(brightness_slider_rect.centerx, brightness_slider_rect.y - int(10 * hf)))
         screen.blit(label_text, label_rect)
 
 
 def handle_menu_events(event):
     global menu_open, current_mode_index, visualization_mode, orbs
-    global slider_active, editing_brightness_floor, brightness_floor_input, control_brightness_floor
+    global slider_active, editing_brightness_floor, brightness_floor_input
+    global editing_hue, hue_input, editing_cycle_rate, cycle_rate_input
+    global manual_hue_value, cycle_rate, control_brightness_floor
+
     if event.type == pygame.MOUSEBUTTONDOWN:
         mx, my = event.pos
-        if menu_button_rect.collidepoint(mx, my) or menu_panel_rect.collidepoint(mx, my):
+        # Check if click is inside the menu (panel or button)
+        if menu_panel_rect.collidepoint(mx, my) or menu_button_rect.collidepoint(mx, my):
             menu_open = True
-            if mode_button_rect.collidepoint(mx, my):
+            # Cancel editing for all fields
+            editing_hue = False
+            editing_cycle_rate = False
+            editing_brightness_floor = False
+            # Check brightness slider field first.
+            if brightness_slider_rect.collidepoint(mx, my):
+                if event.button == 1:
+                    slider_active = True
+                    print("[DEBUG] Brightness slider activated at", event.pos)
+                elif event.button == 3:
+                    editing_brightness_floor = True
+                    brightness_floor_input = ""
+            elif mode_field_rect.collidepoint(mx, my):
                 current_mode_index = (current_mode_index + 1) % len(available_modes)
                 visualization_mode = available_modes[current_mode_index]
                 if visualization_mode == "gravity" and not orbs:
                     init_orbs()
-            slider_rect = get_slider_rect()
-            if slider_rect.collidepoint(mx, my):
-                if event.button == 1:
-                    slider_active = True
-                elif event.button == 3:  # Right-click to edit
-                    editing_brightness_floor = True
-                    brightness_floor_input = ""
+            elif hue_field_rect.collidepoint(mx, my):
+                editing_hue = True
+                hue_input = ""
+            elif cycle_rate_field_rect.collidepoint(mx, my):
+                editing_cycle_rate = True
+                cycle_rate_input = ""
         else:
             menu_open = False
+
     elif event.type == pygame.MOUSEBUTTONUP:
         if event.button == 1:
             slider_active = False
+
     elif event.type == pygame.MOUSEMOTION:
         if slider_active and not editing_brightness_floor:
-            slider_rect = get_slider_rect()
-            relative_x = event.pos[0] - slider_rect.x
-            new_val = relative_x / slider_rect.width
+            # Debug prints
+            print("[DEBUG] Mouse moved:", event.pos)
+            print("[DEBUG] Brightness slider rect:", brightness_slider_rect)
+            relative_x = event.pos[0] - brightness_slider_rect.x
+            new_val = relative_x / brightness_slider_rect.width
             new_val = max(0, min(new_val, 1))
             control_brightness_floor = new_val
-
+            print(f"[DEBUG] control_brightness_floor updated to: {control_brightness_floor}")
 
 
 def handle_keyboard_events(event):
     global editing_brightness_floor, brightness_floor_input, control_brightness_floor
+    global editing_hue, hue_input, manual_hue_value, manual_hue
+    global editing_cycle_rate, cycle_rate_input, cycle_rate
+
+    # Brightness editing
     if editing_brightness_floor:
         if event.type == pygame.KEYDOWN:
             if event.key == pygame.K_RETURN:
-                # Remove any trailing "%" and parse the input as an integer.
-                input_str = brightness_floor_input.strip()
-                if input_str.endswith("%"):
-                    input_str = input_str[:-1].strip()
+                s = brightness_floor_input.strip()
+                if s.endswith("%"):
+                    s = s[:-1].strip()
                 try:
-                    new_val = int(input_str)
-                    # Clamp the value between 0 and 100.
-                    new_val = max(0, min(new_val, 100))
-                    control_brightness_floor = new_val / 100.0
-                    brightness_floor_input = f"{new_val}%"
+                    val = int(s)
+                    val = max(0, min(val, 100))
+                    control_brightness_floor = val / 100.0
+                    brightness_floor_input = f"{val}%"
                 except ValueError:
                     brightness_floor_input = f"{int(control_brightness_floor * 100)}%"
                 editing_brightness_floor = False
@@ -686,50 +775,47 @@ def handle_keyboard_events(event):
                 elif event.unicode == "%" and "%" not in brightness_floor_input:
                     brightness_floor_input += event.unicode
 
+    # Hue editing
+    if editing_hue:
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_RETURN:
+                s = hue_input.strip()
+                try:
+                    val = float(s)
+                    manual_hue_value = val
+                    manual_hue = (val != 0)
+                    print(f"[DEBUG] Manual hue set to {manual_hue_value} (manual_hue={manual_hue})")
+                except ValueError:
+                    print("[DEBUG] Invalid hue input!")
+                editing_hue = False
+            elif event.key == pygame.K_BACKSPACE:
+                hue_input = hue_input[:-1]
+            else:
+                if event.unicode.isdigit() or event.unicode == '.':
+                    hue_input += event.unicode
 
-def update_menu_dimensions():
-    global MENU_BUTTON_WIDTH, MENU_BUTTON_HEIGHT, MENU_BUTTON_MARGIN
-    global MENU_PANEL_WIDTH, MENU_PANEL_HEIGHT
-    global menu_button_rect, menu_panel_rect, mode_button_rect, empty_button_rect
-    global MENU_FONT_SIZE, BRIGHTNESS_FONT_SIZE, menu_font, brightness_font
+    # Cycle rate editing
+    if editing_cycle_rate:
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_RETURN:
+                s = cycle_rate_input.strip()
+                try:
+                    val = float(s)
+                    cycle_rate = val
+                    print(f"[DEBUG] Cycle rate set to {cycle_rate}")
+                except ValueError:
+                    print("[DEBUG] Invalid cycle rate input!")
+                editing_cycle_rate = False
+            elif event.key == pygame.K_BACKSPACE:
+                cycle_rate_input = cycle_rate_input[:-1]
+            else:
+                if event.unicode.isdigit() or event.unicode == '.':
+                    cycle_rate_input += event.unicode
 
-    width_factor = WINDOW_WIDTH / BASE_WIDTH
-    height_factor = WINDOW_HEIGHT / BASE_HEIGHT
-
-    MENU_BUTTON_WIDTH = int(100 * width_factor)
-    MENU_BUTTON_HEIGHT = int(40 * height_factor)
-    MENU_BUTTON_MARGIN = int(20 * height_factor)
-    MENU_PANEL_WIDTH = int(150 * width_factor)
-    MENU_PANEL_HEIGHT = int(100 * height_factor)
-
-    MENU_FONT_SIZE = int(18 * height_factor)
-    BRIGHTNESS_FONT_SIZE = int(56 * height_factor)
-    menu_font = pygame.font.SysFont("Arial", MENU_FONT_SIZE)
-    brightness_font = pygame.font.SysFont("Arial", BRIGHTNESS_FONT_SIZE)
-
-    menu_button_rect.x = WINDOW_WIDTH - MENU_BUTTON_WIDTH - MENU_BUTTON_MARGIN
-    menu_button_rect.y = WINDOW_HEIGHT - MENU_BUTTON_HEIGHT - MENU_BUTTON_MARGIN
-    menu_button_rect.width = MENU_BUTTON_WIDTH
-    menu_button_rect.height = MENU_BUTTON_HEIGHT
-
-    menu_panel_rect.x = menu_button_rect.x - (MENU_PANEL_WIDTH - MENU_BUTTON_WIDTH)
-    menu_panel_rect.y = menu_button_rect.y - MENU_PANEL_HEIGHT
-    menu_panel_rect.width = MENU_PANEL_WIDTH
-    menu_panel_rect.height = MENU_PANEL_HEIGHT
-
-    mode_button_rect.x = menu_panel_rect.x + int(10 * width_factor)
-    mode_button_rect.y = menu_panel_rect.y + int(10 * height_factor)
-    mode_button_rect.width = MENU_PANEL_WIDTH - int(20 * width_factor)
-    mode_button_rect.height = int(30 * height_factor)
-
-    empty_button_rect.x = menu_panel_rect.x + int(10 * width_factor)
-    empty_button_rect.y = menu_panel_rect.y + int(50 * height_factor)
-    empty_button_rect.width = MENU_PANEL_WIDTH - int(20 * width_factor)
-    empty_button_rect.height = MENU_PANEL_HEIGHT - int(60 * height_factor)
 
 
 # -----------------------------
-# Main Pygame Loop
+# Main Loop
 # -----------------------------
 running = True
 update_offscreen_surface(WINDOW_WIDTH, WINDOW_HEIGHT)
@@ -737,7 +823,6 @@ if visualization_mode == "polygon":
     if not cube_vertices:
         init_cube()
 elif visualization_mode == "waveform":
-    # Ensure waveform buffers are initialized before drawing the waveform.
     update_waveform_buffers()
     draw_waveform_mode()
 
@@ -763,15 +848,19 @@ while running:
             screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.RESIZABLE)
             update_offscreen_surface(WINDOW_WIDTH, WINDOW_HEIGHT)
             update_menu_dimensions()
+            update_meter_dimensions()
         handle_menu_events(event)
         handle_keyboard_events(event)
 
     screen.fill((0, 0, 0))
 
+    # Update hue: if manual_hue is False, auto-cycle using cycle_rate; else use manual_hue_value.
     if not manual_hue:
-        hue_value += control_speed
+        hue_value += cycle_rate
         if hue_value > 1.0:
             hue_value -= 1.0
+    else:
+        hue_value = manual_hue_value
 
     brightness = max(glow_value * control_sensitivity, control_brightness_floor)
     r, g, b = colorsys.hsv_to_rgb(hue_value, 1.0, brightness)
